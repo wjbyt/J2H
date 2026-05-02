@@ -3,7 +3,7 @@ package com.wjbyt.j2h.heif
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.media.HeifWriter
+import androidx.heifwriter.HeifWriter
 import androidx.documentfile.provider.DocumentFile
 import androidx.exifinterface.media.ExifInterface
 import com.wjbyt.j2h.exif.JpegExifExtractor
