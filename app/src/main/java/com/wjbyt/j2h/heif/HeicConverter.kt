@@ -3,11 +3,12 @@ package com.wjbyt.j2h.heif
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.HeifWriter
 import androidx.documentfile.provider.DocumentFile
 import androidx.exifinterface.media.ExifInterface
 import com.wjbyt.j2h.exif.JpegExifExtractor
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
+import java.io.File
 
 /**
  * End-to-end JPG → HEIC conversion for a single file with EXIF preservation
@@ -65,13 +66,14 @@ class HeicConverter(
         } ?: return Result.Failed("解码失败")
 
         val heicBytesNoExif = try {
-            ByteArrayOutputStream(jpgBytes.size).use { out ->
-                val ok = bitmap.compress(Bitmap.CompressFormat.HEIC, quality, out)
-                if (!ok) return Result.Failed("HEIC 编码失败")
-                out.toByteArray()
-            }
+            encodeToHeic(bitmap)
+        } catch (e: Exception) {
+            return Result.Failed("HEIC 编码失败: ${e.message}")
         } finally {
             bitmap.recycle()
+        }
+        if (heicBytesNoExif == null || heicBytesNoExif.isEmpty()) {
+            return Result.Failed("HEIC 编码无输出")
         }
 
         val heicBytes = if (exifTiff != null && exifTiff.isNotEmpty()) {
@@ -117,6 +119,32 @@ class HeicConverter(
             return Result.Failed("已转换但删除原文件失败", keepOriginal = true)
         }
         return Result.Ok(targetName, originalSize, out.length())
+    }
+
+    private fun encodeToHeic(bitmap: Bitmap): ByteArray? {
+        // HeifWriter writes to a file. Use app's cache dir for the temp.
+        val tmp = File.createTempFile("j2h_", ".heic", context.cacheDir)
+        try {
+            val writer = HeifWriter.Builder(
+                tmp.absolutePath,
+                bitmap.width,
+                bitmap.height,
+                HeifWriter.INPUT_MODE_BITMAP
+            )
+                .setQuality(quality)
+                .setMaxImages(1)
+                .build()
+            try {
+                writer.start()
+                writer.addBitmap(bitmap)
+                writer.stop(30_000L)
+            } finally {
+                writer.close()
+            }
+            return tmp.readBytes()
+        } finally {
+            tmp.delete()
+        }
     }
 
     private fun decodeBitmap(bytes: ByteArray): Bitmap? {
