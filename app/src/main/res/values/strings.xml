@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HEIC 转换器</string>
+    <string name="add_folder">添加文件夹</string>
+    <string name="start">开始转换</string>
+    <string name="stop">停止</string>
+    <string name="folders_title">已选目录</string>
+    <string name="empty_folders">尚未添加任何目录。点击右下角加号选择包含 JPG 的相册目录。</string>
+    <string name="status_idle">待机</string>
+    <string name="status_scanning">正在扫描</string>
+    <string name="status_running">正在转换</string>
+    <string name="status_done">完成</string>
+    <string name="quality_label">HEIC 质量：95</string>
+    <string name="delete_after_label">校验通过后删除原 JPG</string>
+    <string name="notif_channel_name">转换进度</string>
+    <string name="notif_channel_desc">显示后台转换的进度</string>
+    <string name="notif_title">JPG → HEIC 正在转换</string>
+    <string name="remove">移除</string>
+    <string name="confirm_clear">确认清空所有目录？</string>
+    <string name="cancel">取消</string>
+    <string name="ok">确定</string>
+    <string name="logs_title">最近日志</string>
+    <string name="warning_destructive">⚠ 转换成功并通过校验后会删除原 JPG，无法恢复</string>
+</resources>
