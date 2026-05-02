@@ -11,3 +11,4 @@ captures/
 *.aab
 *.keystore
 gradle/wrapper/gradle-wrapper.jar
+.claude/
