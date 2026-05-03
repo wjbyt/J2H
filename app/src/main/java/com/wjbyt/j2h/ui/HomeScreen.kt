@@ -198,7 +198,7 @@ fun HomeScreen(
                     Box(Modifier.padding(8.dp)) {
                         Column(modifier = Modifier.fillMaxSize()
                             .verticalScroll(rememberScrollState())) {
-                            for (line in state.log.takeLast(200)) {
+                            for (line in state.log.takeLast(800)) {
                                 Text(line, style = MaterialTheme.typography.bodySmall,
                                      fontFamily = FontFamily.Monospace)
                             }

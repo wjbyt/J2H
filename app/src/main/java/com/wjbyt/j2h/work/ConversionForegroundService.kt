@@ -51,7 +51,7 @@ class ConversionForegroundService : Service() {
 
         fun appendLog(line: String) {
             val cur = _state.value
-            val merged = (cur.log + line).takeLast(200)
+            val merged = (cur.log + line).takeLast(800)
             _state.value = cur.copy(log = merged)
         }
     }

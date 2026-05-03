@@ -124,17 +124,18 @@ class HeicConverter(
         // Verification — must be strict enough to catch silent EXIF-injection failures.
         val verifyError = verify(out, sourceFingerprint, hasSourceExif = exifTiff != null && exifTiff.isNotEmpty())
         if (verifyError != null) {
-            // Diagnostics: dump both pre- and post-injection structures so we can pinpoint
-            // where injection went wrong.
+            // Show MMR result FIRST so it survives any later log truncation.
+            val mmrLine = mmrProbe(out)
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(">>> $mmrLine")
+
             val diag = StringBuilder()
-            diag.appendLine(HeifDumper.dump(heicBytesNoExif, "HEIC pre-inject"))
-            diag.appendLine(HeifDumper.dump(heicBytes, "HEIC post-inject"))
+            diag.appendLine(HeifDumper.dump(heicBytesNoExif, "PRE"))
+            diag.appendLine(HeifDumper.dump(heicBytes, "POST"))
             if (exifTiff != null && exifTiff.isNotEmpty()) {
                 val tiffSample = exifTiff.copyOfRange(0, minOf(20, exifTiff.size))
                     .joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
-                diag.appendLine("source TIFF first 20B: $tiffSample (len=${exifTiff.size})")
+                diag.appendLine("src TIFF: $tiffSample (len=${exifTiff.size})")
             }
-            com.wjbyt.j2h.work.ConversionForegroundService.appendLog("---- diagnostics ----")
             for (line in diag.toString().lines()) {
                 if (line.isNotBlank()) com.wjbyt.j2h.work.ConversionForegroundService.appendLog(line)
             }
@@ -190,6 +191,27 @@ class HeicConverter(
         })
     }
 
+    private fun mmrProbe(heic: DocumentFile): String {
+        val tmp = File.createTempFile("mmr_", ".heic", context.cacheDir)
+        return try {
+            context.contentResolver.openInputStream(heic.uri)?.use { input ->
+                tmp.outputStream().use { input.copyTo(it) }
+            }
+            val mmr = MediaMetadataRetriever()
+            mmr.setDataSource(tmp.absolutePath)
+            val off = mmr.extractMetadata(33) // METADATA_KEY_EXIF_OFFSET
+            val len = mmr.extractMetadata(34) // METADATA_KEY_EXIF_LENGTH
+            val w = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_IMAGE_WIDTH)
+            val h = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_IMAGE_HEIGHT)
+            mmr.release()
+            "MMR: img=${w}x${h} EXIF_OFFSET=$off LEN=$len"
+        } catch (e: Exception) {
+            "MMR error: ${e.message}"
+        } finally {
+            tmp.delete()
+        }
+    }
+
     private data class SourceFingerprint(
         val dateTimeOriginal: String? = null,
         val dateTime: String? = null,
@@ -219,17 +241,6 @@ class HeicConverter(
             if (opts.outWidth <= 0 || opts.outHeight <= 0) return "无法解码新 HEIC 的尺寸"
 
             if (hasSourceExif && src.hasReal()) {
-                // Direct MMR query — what AndroidX ExifInterface relies on under the hood.
-                val mmrResult = try {
-                    val mmr = MediaMetadataRetriever()
-                    mmr.setDataSource(tmp.absolutePath)
-                    val off = mmr.extractMetadata(33) // METADATA_KEY_EXIF_OFFSET
-                    val len = mmr.extractMetadata(34) // METADATA_KEY_EXIF_LENGTH
-                    mmr.release()
-                    "MMR EXIF_OFFSET=$off, EXIF_LENGTH=$len"
-                } catch (e: Exception) { "MMR error: ${e.message}" }
-                com.wjbyt.j2h.work.ConversionForegroundService.appendLog("  $mmrResult")
-
                 val exif = try {
                     ExifInterface(tmp.absolutePath)
                 } catch (e: Exception) { return "新 HEIC 的 EXIF 不可读: ${e.message}" }

@@ -12,31 +12,34 @@ object HeifDumper {
         sb.appendLine("=== $label (${heicData.size}B) ===")
         try {
             val top = parseTop(heicData)
-            for (b in top) {
-                sb.appendLine("  TOP ${b.type} @${b.offset} size=${b.size}")
-            }
+            sb.appendLine("  TOP: " + top.joinToString(", ") { "${it.type}@${it.offset}+${it.size}" })
 
             val meta = top.firstOrNull { it.type == "meta" }
             if (meta == null) { sb.appendLine("  (no meta)"); return sb.toString() }
 
-            val subStart = meta.offset + meta.headerSize + 4 // skip version+flags
+            val subStart = meta.offset + meta.headerSize + 4
             val subEnd = meta.offset + meta.size
             val subs = parseList(heicData, subStart, subEnd)
-            for (s in subs) sb.appendLine("    META.${s.type} @${s.offset} size=${s.size}")
+            sb.appendLine("  META subs: " + subs.joinToString(", ") { "${it.type}+${it.size}" })
 
             subs.firstOrNull { it.type == "iinf" }?.let { iinfBox ->
-                sb.appendLine("    --- iinf entries ---")
-                dumpIinf(heicData, iinfBox).forEach { sb.appendLine("      $it") }
+                val entries = dumpIinfRaw(heicData, iinfBox)
+                val byType = entries.groupBy { it.type }.mapValues { it.value.size }
+                sb.appendLine("  iinf: ${entries.size} items, by-type=$byType")
+                // Only show entries that aren't the bulk image-tile type.
+                val bulkType = byType.maxByOrNull { it.value }?.key
+                entries.filter { it.type != bulkType }.forEach {
+                    sb.appendLine("    item id=${it.id} type='${it.type}'")
+                }
             }
             subs.firstOrNull { it.type == "iref" }?.let { irefBox ->
-                sb.appendLine("    --- iref entries ---")
-                dumpIref(heicData, irefBox).forEach { sb.appendLine("      $it") }
+                sb.appendLine("  iref:")
+                dumpIref(heicData, irefBox).forEach { sb.appendLine("    $it") }
             }
             subs.firstOrNull { it.type == "iloc" }?.let { ilocBox ->
-                sb.appendLine("    --- iloc entries ---")
-                dumpIloc(heicData, ilocBox).forEach { sb.appendLine("      $it") }
+                val locInfo = dumpIlocHeader(heicData, ilocBox)
+                sb.appendLine("  iloc: $locInfo")
 
-                // For each iloc entry that names a known Exif item, show the first 16 bytes of data.
                 val exifIds = subs.firstOrNull { it.type == "iinf" }?.let { findExifItemIds(heicData, it) } ?: emptyList()
                 for (id in exifIds) {
                     val (off, len) = locateItem(heicData, ilocBox, id) ?: continue
@@ -44,16 +47,61 @@ object HeifDumper {
                     if (off >= 0 && bytesToShow > 0 && off.toInt() + bytesToShow <= heicData.size) {
                         val sample = heicData.sliceArray(off.toInt() until off.toInt() + bytesToShow)
                             .joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
-                        sb.appendLine("      EXIF item $id @offset=$off len=$len → first ${bytesToShow}B: $sample")
+                        sb.appendLine("  Exif item $id @${off} len=${len}: $sample")
                     } else {
-                        sb.appendLine("      EXIF item $id @offset=$off len=$len → OUT OF FILE BOUNDS!")
+                        sb.appendLine("  Exif item $id @${off} len=${len} OUT OF BOUNDS")
                     }
                 }
+            }
+            subs.firstOrNull { it.type == "pitm" }?.let { pitmBox ->
+                val p = pitmBox.offset.toInt() + pitmBox.headerSize
+                val v = heicData[p].toInt() and 0xFF
+                val pid = if (v == 0) readU16(heicData, (p + 4).toLong())
+                          else readU32(heicData, (p + 4).toLong()).toInt()
+                sb.appendLine("  pitm: primary item id=$pid")
             }
         } catch (e: Exception) {
             sb.appendLine("  PARSE ERROR: ${e.message}")
         }
         return sb.toString()
+    }
+
+    private data class IinfEntryRaw(val id: Int, val type: String)
+    private fun dumpIinfRaw(data: ByteArray, box: Box): List<IinfEntryRaw> {
+        val res = mutableListOf<IinfEntryRaw>()
+        var p = box.offset.toInt() + box.headerSize
+        val ver = data[p].toInt() and 0xFF
+        p += 4
+        val cnt = if (ver == 0) readU16(data, p.toLong()).also { p += 2 }
+                  else readU32(data, p.toLong()).toInt().also { p += 4 }
+        for (i in 0 until cnt) {
+            val sz = readU32(data, p.toLong()).toInt()
+            val infeVer = data[p + 8].toInt() and 0xFF
+            var q = p + 12
+            val itemId = if (infeVer < 2) readU16(data, q.toLong()).also { q += 2 }
+                         else if (infeVer == 2) readU16(data, q.toLong()).also { q += 2 }
+                         else readU32(data, q.toLong()).toInt().also { q += 4 }
+            q += 2
+            val itemType = if (infeVer >= 2) String(data, q, 4, Charsets.US_ASCII) else "(legacy)"
+            res += IinfEntryRaw(itemId, itemType)
+            p += sz
+        }
+        return res
+    }
+
+    private fun dumpIlocHeader(data: ByteArray, box: Box): String {
+        var p = box.offset.toInt() + box.headerSize
+        val ver = data[p].toInt() and 0xFF
+        p += 4
+        val b1 = data[p].toInt() and 0xFF
+        val b2 = data[p + 1].toInt() and 0xFF
+        val osz = (b1 shr 4) and 0xF
+        val lsz = b1 and 0xF
+        val bosz = (b2 shr 4) and 0xF
+        val isz = if (ver == 1 || ver == 2) b2 and 0xF else 0
+        p += 2
+        val cnt = if (ver < 2) readU16(data, p.toLong()) else readU32(data, p.toLong()).toInt()
+        return "v=$ver osz=$osz lsz=$lsz bosz=$bosz isz=$isz items=$cnt"
     }
 
     private data class Box(val type: String, val offset: Long, val size: Long, val headerSize: Int)
