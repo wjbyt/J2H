@@ -184,6 +184,11 @@ class ConversionForegroundService : Service() {
 
         val quality = store.qualitySnapshot()
         appendLog("HEIC 质量 = $quality")
+        if (com.wjbyt.j2h.heif.LibheifEncoder.isAvailable()) {
+            appendLog("libheif 编码器: ${com.wjbyt.j2h.heif.LibheifEncoder.version() ?: "?"}")
+        } else {
+            appendLog("libheif 不可用 (${com.wjbyt.j2h.heif.LibheifEncoder.loadError()}), 回退到 HeifWriter")
+        }
         val converter = HeicConverter(applicationContext, quality = quality)
         var done = 0; var failed = 0; var skipped = 0
         for ((idx, f) in files.withIndex()) {

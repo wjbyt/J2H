@@ -81,26 +81,29 @@ class HeicConverter(
             return Result.Failed("解码失败: ${e.message}")
         } ?: return Result.Failed("解码失败")
 
-        val heicBytesNoExif = try {
-            encodeToHeic(bitmap)
+        val encoded = try {
+            encodeToHeic(bitmap, exifTiffForLibheif = exifTiff)
         } catch (e: Exception) {
             return Result.Failed("HEIC 编码失败: ${e.message}")
         } finally {
             bitmap.recycle()
         }
-        if (heicBytesNoExif == null || heicBytesNoExif.isEmpty()) {
+        val heicBytesNoExif = encoded.bytes
+        if (heicBytesNoExif.isEmpty()) {
             return Result.Failed("HEIC 编码无输出")
         }
 
-        val heicBytes = if (exifTiff != null && exifTiff.isNotEmpty()) {
-            try {
+        val heicBytes = when {
+            // libheif already embedded EXIF; nothing more to do.
+            encoded.exifAlreadyEmbedded -> heicBytesNoExif
+            // No EXIF available from source; nothing to inject.
+            exifTiff == null || exifTiff.isEmpty() -> heicBytesNoExif
+            // Fallback path: hand-rolled container patcher.
+            else -> try {
                 HeifExifInjector.inject(heicBytesNoExif, exifTiff)
             } catch (e: Exception) {
-                // EXIF preservation is required; do not delete original.
                 return Result.Failed("EXIF 注入失败: ${e.message}", keepOriginal = true)
             }
-        } else {
-            heicBytesNoExif
         }
 
         // Create the destination file. If a stale 0-byte placeholder exists, remove it.
@@ -166,21 +169,36 @@ class HeicConverter(
         return Result.Ok(targetName, originalSize, out.length())
     }
 
-    private fun encodeToHeic(bitmap: Bitmap): ByteArray? {
-        // HeifWriter writes to a file. Use app's cache dir for the temp.
-        val tmp = File.createTempFile("j2h_", ".heic", context.cacheDir)
+    /**
+     * Encode bitmap → HEIC. Prefers libheif (native, supports embedded EXIF readable
+     * by gallery apps). Falls back to HeifWriter only when the native lib hasn't been
+     * loaded yet (e.g. .so not yet committed to the repo).
+     *
+     * When libheif is used and exifTiff is non-null, EXIF is embedded by libheif
+     * itself — caller must NOT post-process with HeifExifInjector.
+     */
+    private fun encodeToHeic(bitmap: Bitmap, exifTiffForLibheif: ByteArray?): EncodedHeic {
+        if (LibheifEncoder.isAvailable()) {
+            val tmp = File.createTempFile("j2h_lh_", ".heic", context.cacheDir)
+            try {
+                val err = LibheifEncoder.encode(bitmap, exifTiffForLibheif, tmp.absolutePath, quality)
+                if (err != null) {
+                    throw RuntimeException("libheif: $err")
+                }
+                return EncodedHeic(tmp.readBytes(), exifAlreadyEmbedded = exifTiffForLibheif != null)
+            } finally {
+                tmp.delete()
+            }
+        }
+
+        // Fallback: HeifWriter (no EXIF embedded; caller must inject).
+        val tmp = File.createTempFile("j2h_hw_", ".heic", context.cacheDir)
         try {
             val writer = HeifWriter.Builder(
-                tmp.absolutePath,
-                bitmap.width,
-                bitmap.height,
-                HeifWriter.INPUT_MODE_BITMAP
+                tmp.absolutePath, bitmap.width, bitmap.height, HeifWriter.INPUT_MODE_BITMAP
             )
                 .setQuality(quality)
                 .setMaxImages(1)
-                // Critical: AOSP MediaMetadataRetriever does NOT extract EXIF from
-                // grid-tiled HEIC. Force single-frame HEVC so the primary item is the
-                // actual image, which MMR (and therefore ExifInterface) can read EXIF for.
                 .setGridEnabled(false)
                 .build()
             try {
@@ -190,11 +208,13 @@ class HeicConverter(
             } finally {
                 writer.close()
             }
-            return tmp.readBytes()
+            return EncodedHeic(tmp.readBytes(), exifAlreadyEmbedded = false)
         } finally {
             tmp.delete()
         }
     }
+
+    private data class EncodedHeic(val bytes: ByteArray, val exifAlreadyEmbedded: Boolean)
 
     private fun decodeBitmap(bytes: ByteArray): Bitmap? {
         // ARGB_8888 + sample size 1: full resolution, no quality changes from BitmapFactory.

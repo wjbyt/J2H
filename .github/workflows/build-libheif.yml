@@ -1,0 +1,119 @@
+name: Build libheif (one-time)
+
+# Manually triggered: builds libheif + x265 for arm64-v8a, uploads as artifact.
+# I download the artifact and commit the .so + headers into the repo for the
+# main APK workflow to use. Re-run only when bumping libheif/x265 versions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      libheif_ref:
+        description: libheif git ref (tag or branch)
+        default: v1.20.1
+      x265_ref:
+        description: x265 mercurial branch (we use mirror)
+        default: "3.6"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NDK r26d
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config
+
+      - name: Fetch x265
+        run: |
+          git clone --depth 1 --branch ${{ github.event.inputs.x265_ref }} https://bitbucket.org/multicoreware/x265_git.git x265
+
+      - name: Build x265 (static, arm64-v8a)
+        env:
+          NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          export NDK="${ANDROID_NDK_HOME:-$NDK}"
+          [ -z "$NDK" ] && NDK=$(echo $RUNNER_TEMP/../../_temp/setup-ndk*/android-ndk-* | head -1)
+          [ -z "$NDK" ] && NDK=$(ls -d $RUNNER_TOOL_CACHE/ndk/26.*/x64 2>/dev/null | head -1)
+          echo "Using NDK at: $NDK"
+          ls "$NDK/build/cmake/android.toolchain.cmake"
+          mkdir -p x265/source/build-arm64
+          cd x265/source/build-arm64
+          cmake -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-21 \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_CLI=OFF \
+            -DENABLE_ASSEMBLY=OFF \
+            -DENABLE_PIC=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+          ninja
+          ls -la libx265.a
+
+      - name: Fetch libheif
+        run: |
+          git clone --depth 1 --branch ${{ github.event.inputs.libheif_ref }} https://github.com/strukturag/libheif.git
+
+      - name: Build libheif (shared, arm64-v8a, x265 encoder only, no decoder)
+        env:
+          NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          export NDK="${ANDROID_NDK_HOME:-$NDK}"
+          [ -z "$NDK" ] && NDK=$(echo $RUNNER_TEMP/../../_temp/setup-ndk*/android-ndk-* | head -1)
+          [ -z "$NDK" ] && NDK=$(ls -d $RUNNER_TOOL_CACHE/ndk/26.*/x64 2>/dev/null | head -1)
+          X265_PREFIX="$GITHUB_WORKSPACE/x265/source/build-arm64"
+          mkdir -p libheif/build-arm64
+          cd libheif/build-arm64
+          cmake -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-30 \
+            -DBUILD_SHARED_LIBS=ON \
+            -DWITH_X265=ON \
+            -DX265_INCLUDE_DIR="$GITHUB_WORKSPACE/x265/source" \
+            -DX265_LIBRARY="$X265_PREFIX/libx265.a" \
+            -DWITH_LIBDE265=OFF \
+            -DWITH_DAV1D=OFF \
+            -DWITH_AOM_DECODER=OFF \
+            -DWITH_AOM_ENCODER=OFF \
+            -DWITH_LIBSHARPYUV=OFF \
+            -DWITH_JPEG_DECODER=OFF \
+            -DWITH_JPEG_ENCODER=OFF \
+            -DWITH_TIFF=OFF \
+            -DWITH_OpenJPEG_DECODER=OFF \
+            -DWITH_OpenJPEG_ENCODER=OFF \
+            -DWITH_OPENH264_DECODER=OFF \
+            -DWITH_FFMPEG_DECODER=OFF \
+            -DWITH_KVAZAAR=OFF \
+            -DWITH_UVG266=OFF \
+            -DWITH_VVENC=OFF \
+            -DWITH_VVDEC=OFF \
+            -DENABLE_PLUGIN_LOADING=OFF \
+            -DBUILD_TESTING=OFF \
+            -DWITH_EXAMPLES=OFF \
+            -DWITH_GDK_PIXBUF=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+          ninja
+          find . -name "libheif*.so" -exec ls -la {} \;
+
+      - name: Stage outputs
+        run: |
+          mkdir -p out/jniLibs/arm64-v8a out/include/libheif
+          cp libheif/build-arm64/libheif/libheif.so out/jniLibs/arm64-v8a/
+          # Copy public headers exactly as they're meant to be #included
+          cp libheif/libheif/api/libheif/*.h out/include/libheif/
+          ls -laR out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libheif-arm64
+          path: out
+          if-no-files-found: error
