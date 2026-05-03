@@ -128,7 +128,10 @@ jobs:
           "$STRIP" --strip-all out/jniLibs/arm64-v8a/libheif.so
           ls -lh out/jniLibs/arm64-v8a/libheif.so
           cp libheif/libheif/api/libheif/*.h out/include/libheif/
+          # Pick up generated headers (heif_version.h is configured at build time).
+          cp libheif/build-arm64/libheif/api/libheif/*.h out/include/libheif/ 2>/dev/null || true
           ls -laR out
+          ls out/include/libheif/heif_version.h
 
       - uses: actions/upload-artifact@v4
         with:
