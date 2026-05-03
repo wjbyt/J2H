@@ -14,9 +14,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -38,6 +40,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.widget.Toast
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
@@ -173,15 +178,30 @@ fun HomeScreen(
             Spacer(Modifier.height(16.dp))
 
             // ----- log -----
-            Text(stringFrom(R.string.logs_title), style = MaterialTheme.typography.titleMedium)
+            Row(verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()) {
+                Text(stringFrom(R.string.logs_title),
+                     style = MaterialTheme.typography.titleMedium,
+                     modifier = Modifier.weight(1f))
+                IconButton(onClick = {
+                    val full = state.log.joinToString("\n")
+                    val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("J2H log", full))
+                    Toast.makeText(ctx, "日志已复制 (${full.length} 字符)", Toast.LENGTH_SHORT).show()
+                }) {
+                    Icon(Icons.Filled.ContentCopy, contentDescription = "复制全部日志")
+                }
+            }
             Spacer(Modifier.height(4.dp))
             Card(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                Box(Modifier.padding(8.dp)) {
-                    Column(modifier = Modifier.fillMaxSize()
-                        .verticalScroll(rememberScrollState())) {
-                        for (line in state.log.takeLast(80)) {
-                            Text(line, style = MaterialTheme.typography.bodySmall,
-                                 fontFamily = FontFamily.Monospace)
+                SelectionContainer {
+                    Box(Modifier.padding(8.dp)) {
+                        Column(modifier = Modifier.fillMaxSize()
+                            .verticalScroll(rememberScrollState())) {
+                            for (line in state.log.takeLast(200)) {
+                                Text(line, style = MaterialTheme.typography.bodySmall,
+                                     fontFamily = FontFamily.Monospace)
+                            }
                         }
                     }
                 }
