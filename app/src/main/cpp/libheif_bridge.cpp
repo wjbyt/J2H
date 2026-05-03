@@ -22,14 +22,16 @@
 namespace {
 
 struct Cleanup {
-    heif_context*       ctx     = nullptr;
-    heif_encoder*       enc     = nullptr;
-    heif_image*         img     = nullptr;
-    heif_image_handle*  handle  = nullptr;
+    heif_context*           ctx     = nullptr;
+    heif_encoder*           enc     = nullptr;
+    heif_image*             img     = nullptr;
+    heif_image_handle*      handle  = nullptr;
+    heif_encoding_options*  opts    = nullptr;
     ~Cleanup() {
         if (handle) heif_image_handle_release(handle);
         if (img)    heif_image_release(img);
         if (enc)    heif_encoder_release(enc);
+        if (opts)   heif_encoding_options_free(opts);
         if (ctx)    heif_context_free(ctx);
     }
 };
@@ -93,14 +95,14 @@ Java_com_wjbyt_j2h_heif_LibheifEncoder_nativeEncode(
         }
     }
 
-    // Encode as RGB (3 channels, no alpha) — JPG sources have no alpha and
-    // libheif would otherwise emit a separate auxiliary alpha image item, which
-    // some HEIF parsers (notably AOSP MediaMetadataRetriever and the vivo gallery)
-    // appear to choke on, failing to surface EXIF.
+    // Feed libheif RGBA (Android Bitmap layout) and ask it to drop the alpha via
+    // encoding options — this avoids the separate alpha-as-auxiliary item that
+    // the user's gallery / AOSP MMR can't traverse, while keeping the simple
+    // memcpy path that we know produces openable HEICs.
     {
         heif_error err = heif_image_create(
                 (int)info.width, (int)info.height,
-                heif_colorspace_RGB, heif_chroma_interleaved_RGB,
+                heif_colorspace_RGB, heif_chroma_interleaved_RGBA,
                 &g.img);
         if (err.code != heif_error_Ok) {
             AndroidBitmap_unlockPixels(env, jBitmap);
@@ -125,24 +127,22 @@ Java_com_wjbyt_j2h_heif_LibheifEncoder_nativeEncode(
         return env->NewStringUTF("heif_image_get_plane returned null");
     }
 
-    // Bitmap is ARGB_8888 in memory order R,G,B,A (Android quirk). Drop alpha as
-    // we copy: pack 3 bytes per pixel into the libheif RGB plane.
     const uint8_t* src = static_cast<const uint8_t*>(pixels);
     const uint32_t srcStride = info.stride;
-    const uint32_t w = info.width;
+    const uint32_t rowBytes  = info.width * 4u;
     for (uint32_t y = 0; y < info.height; ++y) {
-        const uint8_t* sRow = src + (size_t)y * srcStride;
-        uint8_t* dRow = dst + (size_t)y * dstStride;
-        for (uint32_t x = 0; x < w; ++x) {
-            dRow[x * 3 + 0] = sRow[x * 4 + 0]; // R
-            dRow[x * 3 + 1] = sRow[x * 4 + 1]; // G
-            dRow[x * 3 + 2] = sRow[x * 4 + 2]; // B
-        }
+        memcpy(dst + (size_t)y * dstStride, src + (size_t)y * srcStride, rowBytes);
     }
     AndroidBitmap_unlockPixels(env, jBitmap);
 
+    // Encoding options: skip the alpha auxiliary item (JPGs are opaque anyway).
+    g.opts = heif_encoding_options_alloc();
+    if (g.opts) {
+        g.opts->save_alpha_channel = 0;
+    }
+
     {
-        heif_error err = heif_context_encode_image(g.ctx, g.img, g.enc, nullptr, &g.handle);
+        heif_error err = heif_context_encode_image(g.ctx, g.img, g.enc, g.opts, &g.handle);
         if (err.code != heif_error_Ok) return heifErrorToJava(env, err);
     }
 

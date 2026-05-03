@@ -269,10 +269,27 @@ class HeicConverter(
                 tmp.readBytes()
             } catch (e: Exception) { return "读回失败: ${e.message}" }
 
-            // Sanity: must be decodable as an image (dimensions readable).
-            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            // Sanity: must actually decode to a usable bitmap. Use a sample size so
+            // we don't allocate ~150 MB just to verify; still proves the bitstream
+            // is decodable end-to-end. Reading dims alone is not enough — a truncated
+            // file can still report dimensions from its meta box.
+            val opts = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
             BitmapFactory.decodeFile(tmp.absolutePath, opts)
             if (opts.outWidth <= 0 || opts.outHeight <= 0) return "无法解码新 HEIC 的尺寸"
+            val sample = generateSequence(1) { it * 2 }
+                .first { (opts.outWidth.toLong() * opts.outHeight) / (it.toLong() * it) <= 1_000_000 }
+            val testBitmap = try {
+                BitmapFactory.decodeFile(tmp.absolutePath, BitmapFactory.Options().apply {
+                    inSampleSize = sample
+                    inPreferredConfig = Bitmap.Config.RGB_565
+                })
+            } catch (e: Exception) { return "新 HEIC 解码异常: ${e.message}" }
+            if (testBitmap == null || testBitmap.width <= 0 || testBitmap.height <= 0) {
+                return "新 HEIC 实际解码返回空，bitstream 可能损坏"
+            }
+            testBitmap.recycle()
 
             if (hasSourceExif) {
                 // Don't trust ExifInterface / MediaMetadataRetriever for HEIF — they fail
