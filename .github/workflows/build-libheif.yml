@@ -62,15 +62,17 @@ jobs:
           git clone --depth 1 --branch ${{ github.event.inputs.libheif_ref }} https://github.com/strukturag/libheif.git
 
       - name: Build libheif (shared, arm64-v8a, x265 encoder only, no decoder)
+        id: build_libheif
         env:
           NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          set -o pipefail
           export NDK="${ANDROID_NDK_HOME:-$NDK}"
           [ -z "$NDK" ] && NDK=$(echo $RUNNER_TEMP/../../_temp/setup-ndk*/android-ndk-* | head -1)
           [ -z "$NDK" ] && NDK=$(ls -d $RUNNER_TOOL_CACHE/ndk/26.*/x64 2>/dev/null | head -1)
           X265_PREFIX="$GITHUB_WORKSPACE/x265/source/build-arm64"
           mkdir -p libheif/build-arm64
-          cd libheif/build-arm64
+          (cd libheif/build-arm64 && \
           cmake -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
@@ -100,9 +102,16 @@ jobs:
             -DWITH_EXAMPLES=OFF \
             -DWITH_GDK_PIXBUF=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            ..
-          ninja
-          find . -name "libheif*.so" -exec ls -la {} \;
+            .. && ninja) 2>&1 | tee /tmp/libheif-build.log
+          find libheif -name "libheif*.so" -exec ls -la {} \;
+
+      - name: Upload libheif build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libheif-build-log
+          path: /tmp/libheif-build.log
+          if-no-files-found: warn
 
       - name: Stage outputs
         run: |
