@@ -15,13 +15,27 @@ android {
         versionName = "1.0.0"
     }
 
+    signingConfigs {
+        getByName("debug") {
+            // Stable keystore checked into the repo so APKs across CI builds share one
+            // signing key — Android refuses to upgrade if the key changes.
+            val ks = rootProject.file("app/debug.keystore")
+            if (ks.exists()) {
+                storeFile = ks
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
         release {
             isMinifyEnabled = false
-            // signed by debug key in CI for personal install convenience
             signingConfig = signingConfigs.getByName("debug")
         }
     }

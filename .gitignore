@@ -10,5 +10,6 @@ captures/
 *.apk
 *.aab
 *.keystore
+!app/debug.keystore
 gradle/wrapper/gradle-wrapper.jar
 .claude/

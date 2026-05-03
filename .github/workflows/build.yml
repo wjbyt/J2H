@@ -29,6 +29,26 @@ jobs:
       - name: Generate Gradle wrapper jar
         run: gradle wrapper --gradle-version 8.7 --distribution-type bin
 
+      - name: Ensure stable debug keystore
+        run: |
+          if [ ! -f app/debug.keystore ]; then
+            echo "Generating new debug keystore (one-time)…"
+            keytool -genkey -v \
+              -keystore app/debug.keystore \
+              -alias androiddebugkey \
+              -storepass android -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          ls -la app/debug.keystore
+
+      - name: Upload keystore (so it can be committed for stable signatures)
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-keystore
+          path: app/debug.keystore
+          if-no-files-found: error
+
       - name: Build debug APK
         id: gradle_build
         run: |
