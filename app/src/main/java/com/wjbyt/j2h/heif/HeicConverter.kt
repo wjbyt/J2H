@@ -139,7 +139,21 @@ class HeicConverter(
             for (line in diag.toString().lines()) {
                 if (line.isNotBlank()) com.wjbyt.j2h.work.ConversionForegroundService.appendLog(line)
             }
-            out.delete()
+
+            // Keep the failed HEIC alongside the original so the user can manually open it
+            // in their device gallery to determine whether the EXIF is actually missing or
+            // just unreadable to AndroidX ExifInterface. Rename to make the status obvious.
+            val untrustedName = "$baseName.untrusted.heic"
+            try {
+                val untrusted = parent.findFile(untrustedName)
+                untrusted?.delete()
+                out.renameTo(untrustedName)
+                com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                    "  → 失败的 HEIC 已保留为 $untrustedName，原 JPG 未删，可在系统相册手动比对 EXIF"
+                )
+            } catch (e: Exception) {
+                out.delete()
+            }
             return Result.Failed("校验失败: $verifyError", keepOriginal = true)
         }
 
