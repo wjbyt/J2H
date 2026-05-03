@@ -93,10 +93,14 @@ Java_com_wjbyt_j2h_heif_LibheifEncoder_nativeEncode(
         }
     }
 
+    // Encode as RGB (3 channels, no alpha) — JPG sources have no alpha and
+    // libheif would otherwise emit a separate auxiliary alpha image item, which
+    // some HEIF parsers (notably AOSP MediaMetadataRetriever and the vivo gallery)
+    // appear to choke on, failing to surface EXIF.
     {
         heif_error err = heif_image_create(
                 (int)info.width, (int)info.height,
-                heif_colorspace_RGB, heif_chroma_interleaved_RGBA,
+                heif_colorspace_RGB, heif_chroma_interleaved_RGB,
                 &g.img);
         if (err.code != heif_error_Ok) {
             AndroidBitmap_unlockPixels(env, jBitmap);
@@ -121,11 +125,19 @@ Java_com_wjbyt_j2h_heif_LibheifEncoder_nativeEncode(
         return env->NewStringUTF("heif_image_get_plane returned null");
     }
 
+    // Bitmap is ARGB_8888 in memory order R,G,B,A (Android quirk). Drop alpha as
+    // we copy: pack 3 bytes per pixel into the libheif RGB plane.
     const uint8_t* src = static_cast<const uint8_t*>(pixels);
     const uint32_t srcStride = info.stride;
-    const uint32_t rowBytes  = info.width * 4u;
+    const uint32_t w = info.width;
     for (uint32_t y = 0; y < info.height; ++y) {
-        memcpy(dst + (size_t)y * dstStride, src + (size_t)y * srcStride, rowBytes);
+        const uint8_t* sRow = src + (size_t)y * srcStride;
+        uint8_t* dRow = dst + (size_t)y * dstStride;
+        for (uint32_t x = 0; x < w; ++x) {
+            dRow[x * 3 + 0] = sRow[x * 4 + 0]; // R
+            dRow[x * 3 + 1] = sRow[x * 4 + 1]; // G
+            dRow[x * 3 + 2] = sRow[x * 4 + 2]; // B
+        }
     }
     AndroidBitmap_unlockPixels(env, jBitmap);
 

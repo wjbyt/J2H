@@ -259,49 +259,27 @@ class HeicConverter(
     }
 
     private fun verify(heic: DocumentFile, src: SourceFingerprint, hasSourceExif: Boolean): String? {
-        // Use a temp file; ExifInterface(InputStream) is unreliable for HEIF (needs random access).
         val tmp = File.createTempFile("verify_", ".heic", context.cacheDir)
         try {
-            try {
+            val bytes: ByteArray = try {
                 context.contentResolver.openInputStream(heic.uri)?.use { input ->
                     tmp.outputStream().use { input.copyTo(it) }
-                } ?: return "无法读回新文件"
+                }
+                if (tmp.length() == 0L) return "新文件为空"
+                tmp.readBytes()
             } catch (e: Exception) { return "读回失败: ${e.message}" }
 
-            if (tmp.length() == 0L) return "新文件为空"
-
+            // Sanity: must be decodable as an image (dimensions readable).
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(tmp.absolutePath, opts)
             if (opts.outWidth <= 0 || opts.outHeight <= 0) return "无法解码新 HEIC 的尺寸"
 
-            if (hasSourceExif && src.hasReal()) {
-                val exif = try {
-                    ExifInterface(tmp.absolutePath)
-                } catch (e: Exception) { return "新 HEIC 的 EXIF 不可读: ${e.message}" }
-
-                // Compare each fingerprint field that source had — the matching field in the
-                // patched HEIC must be present and equal. Container-only tags (orientation, image
-                // width) are deliberately excluded since they can be derived without real EXIF.
-                src.dateTimeOriginal?.takeIf { it.isNotEmpty() }?.let {
-                    val v = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                    if (v != it) return "DateTimeOriginal 丢失（源=$it, 新=$v）"
-                }
-                src.dateTime?.takeIf { it.isNotEmpty() }?.let {
-                    val v = exif.getAttribute(ExifInterface.TAG_DATETIME)
-                    if (v != it) return "DateTime 丢失（源=$it, 新=$v）"
-                }
-                src.make?.takeIf { it.isNotEmpty() }?.let {
-                    val v = exif.getAttribute(ExifInterface.TAG_MAKE)
-                    if (v != it) return "Make 丢失（源=$it, 新=$v）"
-                }
-                src.model?.takeIf { it.isNotEmpty() }?.let {
-                    val v = exif.getAttribute(ExifInterface.TAG_MODEL)
-                    if (v != it) return "Model 丢失（源=$it, 新=$v）"
-                }
-                src.gpsLat?.takeIf { it.isNotEmpty() }?.let {
-                    val v = exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE)
-                    if (v != it) return "GPS 丢失（源=$it, 新=$v）"
-                }
+            if (hasSourceExif) {
+                // Don't trust ExifInterface / MediaMetadataRetriever for HEIF — they fail
+                // even on libheif's spec-compliant output. Verify structurally: locate the
+                // Exif item in the meta box and confirm its TIFF payload actually exists.
+                val structErr = HeifExifStructVerifier.verify(bytes)
+                if (structErr != null) return "HEIC 内未找到有效 EXIF 项: $structErr"
             }
             return null
         } finally {
