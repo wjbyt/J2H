@@ -3,6 +3,7 @@ package com.wjbyt.j2h.heif
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import androidx.heifwriter.HeifWriter
 import androidx.documentfile.provider.DocumentFile
 import androidx.exifinterface.media.ExifInterface
@@ -162,6 +163,10 @@ class HeicConverter(
             )
                 .setQuality(quality)
                 .setMaxImages(1)
+                // Critical: AOSP MediaMetadataRetriever does NOT extract EXIF from
+                // grid-tiled HEIC. Force single-frame HEVC so the primary item is the
+                // actual image, which MMR (and therefore ExifInterface) can read EXIF for.
+                .setGridEnabled(false)
                 .build()
             try {
                 writer.start()
@@ -214,6 +219,17 @@ class HeicConverter(
             if (opts.outWidth <= 0 || opts.outHeight <= 0) return "无法解码新 HEIC 的尺寸"
 
             if (hasSourceExif && src.hasReal()) {
+                // Direct MMR query — what AndroidX ExifInterface relies on under the hood.
+                val mmrResult = try {
+                    val mmr = MediaMetadataRetriever()
+                    mmr.setDataSource(tmp.absolutePath)
+                    val off = mmr.extractMetadata(33) // METADATA_KEY_EXIF_OFFSET
+                    val len = mmr.extractMetadata(34) // METADATA_KEY_EXIF_LENGTH
+                    mmr.release()
+                    "MMR EXIF_OFFSET=$off, EXIF_LENGTH=$len"
+                } catch (e: Exception) { "MMR error: ${e.message}" }
+                com.wjbyt.j2h.work.ConversionForegroundService.appendLog("  $mmrResult")
+
                 val exif = try {
                     ExifInterface(tmp.absolutePath)
                 } catch (e: Exception) { return "新 HEIC 的 EXIF 不可读: ${e.message}" }
