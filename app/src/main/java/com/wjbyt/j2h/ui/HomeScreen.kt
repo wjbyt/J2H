@@ -28,6 +28,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -56,6 +57,7 @@ fun HomeScreen(
     val ctx = LocalContext.current
     val store = remember { TreeUriStore(ctx) }
     val uris by store.uris.collectAsState(initial = emptyList())
+    val quality by store.quality.collectAsState(initial = 95)
     val state by ConversionForegroundService.state.collectAsState()
     val scope = rememberCoroutineScope()
 
@@ -120,9 +122,22 @@ fun HomeScreen(
             Text(stringFrom(R.string.warning_destructive),
                  style = MaterialTheme.typography.bodySmall,
                  color = MaterialTheme.colorScheme.error)
-            Text(stringFrom(R.string.quality_label) + " · " +
-                 stringFrom(R.string.delete_after_label),
-                 style = MaterialTheme.typography.bodySmall)
+
+            Spacer(Modifier.height(8.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("HEIC 质量：$quality", style = MaterialTheme.typography.titleSmall)
+                    Slider(
+                        value = quality.toFloat(),
+                        onValueChange = { v -> scope.launch { store.setQuality(v.toInt()) } },
+                        valueRange = 50f..100f,
+                        steps = 49,
+                        enabled = !state.running
+                    )
+                    Text("校验通过后再删除原 JPG（DateTime/GPS 必须能在新 HEIC 中读到）",
+                         style = MaterialTheme.typography.bodySmall)
+                }
+            }
 
             Spacer(Modifier.height(16.dp))
 

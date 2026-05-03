@@ -182,7 +182,9 @@ class ConversionForegroundService : Service() {
         _state.value = _state.value.copy(total = files.size)
         appendLog("共发现 ${files.size} 张 JPG，开始转换…")
 
-        val converter = HeicConverter(applicationContext, quality = 95)
+        val quality = store.qualitySnapshot()
+        appendLog("HEIC 质量 = $quality")
+        val converter = HeicConverter(applicationContext, quality = quality)
         var done = 0; var failed = 0; var skipped = 0
         for ((idx, f) in files.withIndex()) {
             if (!currentCoroutineContext().isActive) break

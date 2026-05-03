@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -12,6 +13,7 @@ import kotlinx.coroutines.flow.map
 
 private val Context.dataStore by preferencesDataStore(name = "tree_uris")
 private val KEY_URIS = stringSetPreferencesKey("uris")
+private val KEY_QUALITY = intPreferencesKey("heic_quality")
 
 class TreeUriStore(private val context: Context) {
 
@@ -48,4 +50,16 @@ class TreeUriStore(private val context: Context) {
     }
 
     suspend fun snapshot(): List<Uri> = uris.first()
+
+    val quality: Flow<Int> = context.dataStore.data.map { prefs ->
+        (prefs[KEY_QUALITY] ?: 95).coerceIn(50, 100)
+    }
+
+    suspend fun setQuality(q: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_QUALITY] = q.coerceIn(50, 100)
+        }
+    }
+
+    suspend fun qualitySnapshot(): Int = quality.first()
 }
