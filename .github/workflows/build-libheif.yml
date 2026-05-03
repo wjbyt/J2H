@@ -56,6 +56,9 @@ jobs:
             ..
           ninja
           ls -la libx265.a
+          # x265_config.h is generated into the build dir; libheif's encoder_x265.cc
+          # needs to find it next to x265.h, so copy it into the source dir.
+          cp x265_config.h ../x265_config.h
 
       - name: Fetch libheif
         run: |
