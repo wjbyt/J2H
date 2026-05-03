@@ -116,11 +116,17 @@ jobs:
           path: /tmp/libheif-build.log
           if-no-files-found: warn
 
-      - name: Stage outputs
+      - name: Stage outputs (strip to shrink ~3x)
         run: |
           mkdir -p out/jniLibs/arm64-v8a out/include/libheif
-          cp libheif/build-arm64/libheif/libheif.so out/jniLibs/arm64-v8a/
-          # Copy public headers exactly as they're meant to be #included
+          cp libheif/build-arm64/libheif/libheif.so out/jniLibs/arm64-v8a/libheif.so
+          # NDK ships llvm-strip; remove debug symbols.
+          NDK="${ANDROID_NDK_HOME}"
+          [ -z "$NDK" ] && NDK=$(ls -d $RUNNER_TOOL_CACHE/ndk/26.*/x64 2>/dev/null | head -1)
+          STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          ls -lh out/jniLibs/arm64-v8a/libheif.so
+          "$STRIP" --strip-all out/jniLibs/arm64-v8a/libheif.so
+          ls -lh out/jniLibs/arm64-v8a/libheif.so
           cp libheif/libheif/api/libheif/*.h out/include/libheif/
           ls -laR out
 
