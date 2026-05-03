@@ -123,6 +123,20 @@ class HeicConverter(
         // Verification — must be strict enough to catch silent EXIF-injection failures.
         val verifyError = verify(out, sourceFingerprint, hasSourceExif = exifTiff != null && exifTiff.isNotEmpty())
         if (verifyError != null) {
+            // Diagnostics: dump both pre- and post-injection structures so we can pinpoint
+            // where injection went wrong.
+            val diag = StringBuilder()
+            diag.appendLine(HeifDumper.dump(heicBytesNoExif, "HEIC pre-inject"))
+            diag.appendLine(HeifDumper.dump(heicBytes, "HEIC post-inject"))
+            if (exifTiff != null && exifTiff.isNotEmpty()) {
+                val tiffSample = exifTiff.copyOfRange(0, minOf(20, exifTiff.size))
+                    .joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+                diag.appendLine("source TIFF first 20B: $tiffSample (len=${exifTiff.size})")
+            }
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog("---- diagnostics ----")
+            for (line in diag.toString().lines()) {
+                if (line.isNotBlank()) com.wjbyt.j2h.work.ConversionForegroundService.appendLog(line)
+            }
             out.delete()
             return Result.Failed("校验失败: $verifyError", keepOriginal = true)
         }
