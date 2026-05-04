@@ -210,9 +210,17 @@ class ConversionForegroundService : Service() {
                         appendLog("✗ $name 失败：${r.reason}（已保留原文件）")
                     }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 failed++
-                appendLog("✗ $name 异常：${e.message}（已保留原文件）")
+                val cls = e.javaClass.simpleName
+                val msg = e.message ?: "(no message)"
+                appendLog("✗ $name 异常 [$cls]：$msg（已保留原文件）")
+                // First few stack frames help pinpoint where the throw happened.
+                e.stackTrace.take(6).forEach { appendLog("    at ${it.className.substringAfterLast('.')}.${it.methodName}(${it.fileName}:${it.lineNumber})") }
+                e.cause?.let { c ->
+                    appendLog("  caused by [${c.javaClass.simpleName}]: ${c.message ?: "(no message)"}")
+                    c.stackTrace.take(4).forEach { appendLog("    at ${it.className.substringAfterLast('.')}.${it.methodName}(${it.fileName}:${it.lineNumber})") }
+                }
             }
             _state.value = _state.value.copy(
                 done = done, failed = failed, skipped = skipped

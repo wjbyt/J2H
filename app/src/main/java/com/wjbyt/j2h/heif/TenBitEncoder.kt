@@ -35,7 +35,13 @@ object TenBitEncoder {
     fun isAvailable(): Boolean = loaded
 
     /** Returns null on success, or an error string. */
-    fun encode(bitmap: Bitmap, outputPath: String, qualityHint: Int = 95): String? {
+    fun encode(bitmap: Bitmap, outputPath: String, qualityHint: Int = 95): String? = try {
+        encodeImpl(bitmap, outputPath, qualityHint)
+    } catch (t: Throwable) {
+        "[${t.javaClass.simpleName}] ${t.message ?: "(no message)"}"
+    }
+
+    private fun encodeImpl(bitmap: Bitmap, outputPath: String, qualityHint: Int): String? {
         if (!loaded) return "10bit native lib not loaded: $loadError"
         if (bitmap.config != Bitmap.Config.RGBA_F16) {
             return "bitmap must be RGBA_F16 (got ${bitmap.config})"

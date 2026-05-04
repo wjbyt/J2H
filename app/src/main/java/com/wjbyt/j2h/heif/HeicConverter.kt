@@ -67,8 +67,17 @@ class HeicConverter(
             } catch (_: Exception) { null }
         } else null
 
-        return if (isDng) convertDng(jpg, parent, targetName, srcBytes, snapshot, existing)
-               else convertJpg(jpg, parent, targetName, srcBytes, exifTiff, snapshot, existing)
+        return try {
+            if (isDng) convertDng(jpg, parent, targetName, srcBytes, snapshot, existing)
+            else convertJpg(jpg, parent, targetName, srcBytes, exifTiff, snapshot, existing)
+        } catch (t: Throwable) {
+            // Last-resort safety net so any uncaught throw becomes a Result with a real
+            // diagnostic message instead of '异常: null' bubbling to the service layer.
+            Result.Failed(
+                "未捕获异常 [${t.javaClass.simpleName}]: ${t.message ?: "(no message)"}",
+                keepOriginal = true
+            )
+        }
     }
 
     /** JPG → 8-bit HEIC via HeifWriter (hardware HEVC Main, fast). */
