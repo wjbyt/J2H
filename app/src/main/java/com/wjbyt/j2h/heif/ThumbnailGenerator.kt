@@ -76,7 +76,8 @@ object ThumbnailGenerator {
         val ipcoSubs = parseList(heic, ipco.offset + ipco.headerSize, ipco.offset + ipco.size)
         val hvcCBox = ipcoSubs.firstOrNull { it.type == "hvcC" } ?: return null
         val hvcCBody = heic.copyOfRange(
-            (hvcCBox.offset + hvcCBox.headerSize).toInt(), hvcCBox.endOffset.toInt()
+            (hvcCBox.offset + hvcCBox.headerSize).toInt(),
+            (hvcCBox.offset + hvcCBox.size).toInt()
         )
 
         // Image bitstream: iloc tells us where the single hvc1 item lives.
