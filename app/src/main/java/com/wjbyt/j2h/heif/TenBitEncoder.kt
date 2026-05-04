@@ -136,7 +136,12 @@ object TenBitEncoder {
         }
     }
 
-    /** Allocate one input buffer, fill with P010 from the bitmap, queue with EOS. */
+    /**
+     * Pack the bitmap into the codec's raw input buffer as P010 (Y plane then
+     * interleaved UV plane, each row tightly packed at width*2 bytes).
+     * Avoids the Image API since for some encoders the per-plane Buffer
+     * capacities don't match the natural row-stride writes (BufferOverflow).
+     */
     private fun feedInputP010(codec: MediaCodec, bitmap: Bitmap, w: Int, h: Int): String? {
         val inputIdx = codec.dequeueInputBuffer(10_000_000L)
         if (inputIdx < 0) return "no input buffer"
@@ -144,64 +149,24 @@ object TenBitEncoder {
             ?: return "null input buffer"
         inBuf.clear()
 
-        // Use Image API for layout-aware writes — strides may differ from naive WxH.
-        val image = codec.getInputImage(inputIdx)
-            ?: return runFallbackPackP010(codec, inputIdx, inBuf, bitmap, w, h)
-
-        // P010 via Image: 3 planes (Y, U, V). U and V share the same UV interleaved
-        // plane, exposed as two views with pixelStride=4 and offsets 0/2.
-        val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
-
-        val yBuf = yPlane.buffer
-        val uBuf = uPlane.buffer
-        val yRowStride = yPlane.rowStride
-        val uRowStride = uPlane.rowStride
-        // For interleaved UV, U and V buffers point to the same backing region;
-        // U is at offset 0, V at offset 2. Both have rowStride == uRowStride.
-        // We write the whole interleaved row through uBuf with absolute positions.
-
-        // Need a backing byte array that encompasses both Y and UV planes contiguously
-        // in memory. The Image API gives us views over codec-managed memory; we can
-        // write into them directly via JNI.
-        // Simpler approach: ask native to write into a single ByteArray, then copy
-        // into the Image planes respecting strides.
-
-        val yPlaneBytes = yRowStride * h
-        val uvPlaneBytes = uRowStride * (h / 2)
-        val tmp = ByteArray(yPlaneBytes + uvPlaneBytes)
-        val err = nativeRgbaF16ToP010(bitmap, tmp, yRowStride, uRowStride, yPlaneBytes)
-        if (err != null) return err
-
-        yBuf.put(tmp, 0, yPlaneBytes)
-        uBuf.put(tmp, yPlaneBytes, uvPlaneBytes)
-
-        // The encoded sample size to queue equals the conceptual buffer size used
-        // (codec ignores it for input but we pass plane size for safety).
-        val totalBytes = yPlaneBytes + uvPlaneBytes
-        codec.queueInputBuffer(
-            inputIdx, 0, totalBytes, 0,
-            MediaCodec.BUFFER_FLAG_END_OF_STREAM
-        )
-        return null
-    }
-
-    /** Fallback when getInputImage returns null: write to raw input buffer. */
-    private fun runFallbackPackP010(
-        codec: MediaCodec, inputIdx: Int, inBuf: ByteBuffer,
-        bitmap: Bitmap, w: Int, h: Int
-    ): String? {
-        val yStride = w * 2
-        val uvStride = w * 2
+        val yStride = w * 2          // 2 bytes per Y sample
+        val uvStride = w * 2         // 2 bytes per UV sample × 2 samples per pair = 4
+                                     // bytes per chroma pos × W/2 positions = 2W bytes/row
         val ySize = yStride * h
         val uvSize = uvStride * (h / 2)
-        val tmp = ByteArray(ySize + uvSize)
+        val totalBytes = ySize + uvSize
+
+        if (inBuf.capacity() < totalBytes) {
+            return "input buffer too small: cap=${inBuf.capacity()} need=$totalBytes"
+        }
+
+        val tmp = ByteArray(totalBytes)
         val err = nativeRgbaF16ToP010(bitmap, tmp, yStride, uvStride, ySize)
         if (err != null) return err
-        inBuf.put(tmp, 0, tmp.size)
+
+        inBuf.put(tmp, 0, totalBytes)
         codec.queueInputBuffer(
-            inputIdx, 0, tmp.size, 0,
+            inputIdx, 0, totalBytes, 0,
             MediaCodec.BUFFER_FLAG_END_OF_STREAM
         )
         return null
