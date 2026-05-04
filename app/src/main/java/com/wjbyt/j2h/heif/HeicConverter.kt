@@ -42,6 +42,13 @@ class HeicConverter(
         if (existing != null && existing.length() > 0) return Result.Skipped("$targetName 已存在")
 
         val snapshot = MediaStoreSync.readSourceJpg(context, jpg)
+        // Log what we found in the source so we can tell whether missing fields in the
+        // output are due to source content vs. our pipeline.
+        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+            "  源 EXIF: DateTime=${snapshot.dateTakenMillis}, " +
+            "GPS=${if (snapshot.gpsLat != null) "%.6f,%.6f".format(snapshot.gpsLat, snapshot.gpsLon ?: 0.0) else "null"}, " +
+            "Make=${snapshot.make ?: "null"}, Model=${snapshot.model ?: "null"}"
+        )
 
         val jpgBytes = try {
             context.contentResolver.openInputStream(jpg.uri)?.use { it.readBytes() }
