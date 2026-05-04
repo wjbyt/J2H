@@ -88,23 +88,31 @@ object VideoTranscoder {
             return Result.Failed("文件无视频轨")
         }
         val videoMime = videoFormat.getString(MediaFormat.KEY_MIME)!!
-        if (videoMime != MediaFormat.MIMETYPE_VIDEO_HEVC) {
+        // Dolby Vision profile 8.4 has an HEVC base layer; the system DV decoder strips
+        // the RPU and outputs HDR10 BL as a 10-bit P010 surface, which the AV1 encoder
+        // can consume directly. Accept both HEVC and DV MIMEs.
+        val isDolbyVisionInput = videoMime == "video/dolby-vision"
+        if (videoMime != MediaFormat.MIMETYPE_VIDEO_HEVC && !isDolbyVisionInput) {
             extractor.release()
-            return Result.Failed("仅支持 HEVC 输入（实际: $videoMime），跳过非 HEVC 视频")
+            return Result.Failed("仅支持 HEVC 或 DV 输入（实际: $videoMime）")
         }
 
-        // Reject if no hardware AV1 encoder available.
-        if (!hasHardwareAv1Encoder()) {
+        // Pre-flight: AV1 hardware encoder must exist on this device.
+        val av1EncoderName = findHardwareAv1EncoderName()
+        if (av1EncoderName == null) {
             extractor.release()
-            return Result.Failed("本机无硬件 AV1 编码器")
+            val all = listAv1Encoders().joinToString(", ").ifEmpty { "（一个 AV1 编码器都没找到）" }
+            return Result.Failed("本机无硬件 AV1 编码器。系统中找到的 AV1 编码器: $all")
         }
+        com.wjbyt.j2h.work.ConversionForegroundService.appendLog("  · 使用 AV1 编码器: $av1EncoderName")
 
         val w = videoFormat.getInteger(MediaFormat.KEY_WIDTH)
         val h = videoFormat.getInteger(MediaFormat.KEY_HEIGHT)
         val frameRate = if (videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE))
             videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE).coerceIn(1, 240) else 30
 
-        val isHdr = isHdrFormat(videoFormat)
+        // DV input is always HDR.
+        val isHdr = isDolbyVisionInput || isHdrFormat(videoFormat)
 
         // Build encoder format.
         val encoderFormat = MediaFormat.createVideoFormat("video/av01", w, h).apply {
@@ -159,7 +167,7 @@ object VideoTranscoder {
         var muxer: MediaMuxer? = null
         var inputSurface: android.view.Surface? = null
         try {
-            encoder = MediaCodec.createEncoderByType("video/av01")
+            encoder = MediaCodec.createByCodecName(av1EncoderName)
             try {
                 encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             } catch (e: Exception) {
@@ -333,22 +341,35 @@ object VideoTranscoder {
         return false
     }
 
-    private fun hasHardwareAv1Encoder(): Boolean {
+    /** Returns the name of a hardware-accelerated AV1 encoder, or null if none. */
+    private fun findHardwareAv1EncoderName(): String? {
         val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
         for (info in list.codecInfos) {
             if (!info.isEncoder) continue
             if (info.isAlias) continue
-            for (type in info.supportedTypes) {
-                if (!type.equals("video/av01", ignoreCase = true)) continue
-                // Heuristic: hardware encoder names typically don't contain "OMX.google" or
-                // "c2.android" (those are software). vendor names contain qti/qcom/mtk/exynos.
-                val name = info.name.lowercase()
-                val isSoftware = name.startsWith("omx.google.") || name.startsWith("c2.android.") ||
-                                 name.contains(".sw.") || name.contains("software")
-                if (!isSoftware) return true
-            }
+            val supportsAv1 = info.supportedTypes.any { it.equals("video/av01", ignoreCase = true) }
+            if (!supportsAv1) continue
+            // Use the official API instead of name guessing.
+            val isHw = try { info.isHardwareAccelerated } catch (_: Throwable) { false }
+            val isSw = try { info.isSoftwareOnly } catch (_: Throwable) { false }
+            if (isHw && !isSw) return info.name
         }
-        return false
+        return null
+    }
+
+    /** Diagnostic listing of every AV1 encoder + its hw/sw classification. */
+    private fun listAv1Encoders(): List<String> {
+        val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        val out = mutableListOf<String>()
+        for (info in list.codecInfos) {
+            if (!info.isEncoder) continue
+            val supportsAv1 = info.supportedTypes.any { it.equals("video/av01", ignoreCase = true) }
+            if (!supportsAv1) continue
+            val hw = try { info.isHardwareAccelerated } catch (_: Throwable) { false }
+            val sw = try { info.isSoftwareOnly } catch (_: Throwable) { false }
+            out += "${info.name}(hw=$hw,sw=$sw)"
+        }
+        return out
     }
 
     private fun verifyDecodable(context: Context, file: DocumentFile): String? {
