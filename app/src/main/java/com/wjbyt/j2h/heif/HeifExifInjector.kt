@@ -54,6 +54,34 @@ object HeifExifInjector {
         val iref = irefBox?.let { parseIref(heicData, it) }
             ?: IrefData(version = 0, refs = mutableListOf())
 
+        // ----- iprp augmentation: add irot=0 box + associate to primary -----
+        // Samsung-format HEIC has irot in ipco and associates it with the primary
+        // image via ipma. vivo's gallery requires this association before it
+        // considers the file 'a phone photo' worth extracting EXIF from.
+        val iprpBox = subBoxes.firstOrNull { it.type == "iprp" }
+        val newIprpBytes: ByteArray? = iprpBox?.let { ipBox ->
+            val parsed = parseIprp(heicData, ipBox)
+            // Skip if irot already exists in ipco.
+            val hasIrot = parsed.ipcoChildren.any {
+                it.size >= 8 &&
+                it[4] == 'i'.code.toByte() && it[5] == 'r'.code.toByte() &&
+                it[6] == 'o'.code.toByte() && it[7] == 't'.code.toByte()
+            }
+            if (hasIrot) {
+                null
+            } else {
+                val irotBox = wrapBox("irot", byteArrayOf(0x00))
+                val newIpcoChildren = parsed.ipcoChildren + irotBox
+                val newIrotIndex = newIpcoChildren.size // 1-based
+                val newIpmaEntries = parsed.ipmaEntries.map { e ->
+                    if (e.itemId == primaryItemId)
+                        e.copy(associations = e.associations + IpmaAssoc(essential = true, propertyIndex = newIrotIndex))
+                    else e
+                }
+                buildIprp(newIpcoChildren, parsed.ipmaVersion, parsed.ipmaFlags, newIpmaEntries)
+            }
+        }
+
         // ----- Build new sub-box bytes (sizes are deterministic) -----
         val newIinfBytes = buildIinf(
             parsedIinf.version,
@@ -83,9 +111,13 @@ object HeifExifInjector {
         val oldIrefSize = irefBox?.size?.toInt() ?: 0
         val oldIlocSize = ilocBox.size.toInt()
 
+        val iprpDelta = if (newIprpBytes != null && iprpBox != null) {
+            newIprpBytes.size - iprpBox.size.toInt()
+        } else 0
         val sizeDelta = (newIinfBytes.size - oldIinfSize) +
                         (newIrefBytes.size - oldIrefSize) +
-                        (newIlocSizePredicted - oldIlocSize)
+                        (newIlocSizePredicted - oldIlocSize) +
+                        iprpDelta
 
         val newMetaSize = metaBox.size.toInt() + sizeDelta
         val delta = sizeDelta // top-level shift for everything after meta
@@ -169,6 +201,7 @@ object HeifExifInjector {
             return assemble(
                 heicData, topBoxes, metaIdx, metaBox, subBoxes,
                 newIinfBytes, newIrefBytes, irefBox, rebuiltBytes,
+                newIprpBytes,
                 newMetaSizeWithGrowth(newMetaSize, growth),
                 exifBlock
             )
@@ -177,6 +210,7 @@ object HeifExifInjector {
         return assemble(
             heicData, topBoxes, metaIdx, metaBox, subBoxes,
             newIinfBytes, newIrefBytes, irefBox, newIlocBytes,
+            newIprpBytes,
             newMetaSize, exifBlock
         )
     }
@@ -193,6 +227,7 @@ object HeifExifInjector {
         newIrefBytes: ByteArray,
         oldIref: RawBox?,
         newIlocBytes: ByteArray,
+        newIprpBytes: ByteArray?,
         newMetaSize: Int,
         exifBlock: ByteArray
     ): ByteArray {
@@ -205,6 +240,8 @@ object HeifExifInjector {
                 "iinf" -> newMetaPayload.write(newIinfBytes)
                 "iref" -> { newMetaPayload.write(newIrefBytes); irefWritten = true }
                 "iloc" -> newMetaPayload.write(newIlocBytes)
+                "iprp" -> if (newIprpBytes != null) newMetaPayload.write(newIprpBytes)
+                          else newMetaPayload.write(src, sub.offset.toInt(), sub.size.toInt())
                 else -> newMetaPayload.write(src, sub.offset.toInt(), sub.size.toInt())
             }
         }
@@ -621,5 +658,94 @@ object HeifExifInjector {
         var i = from
         while (i < until) { if (d[i] == 0.toByte()) return i; i++ }
         return until
+    }
+
+    // ---------- iprp (item properties) ----------
+
+    data class IpmaAssoc(val essential: Boolean, val propertyIndex: Int) // 1-based
+    data class IpmaEntry(val itemId: Int, val associations: List<IpmaAssoc>)
+    data class IprpData(
+        val ipcoChildren: List<ByteArray>, // each is a complete box (with 8-byte header)
+        val ipmaVersion: Int,
+        val ipmaFlags: Int,
+        val ipmaEntries: List<IpmaEntry>
+    )
+
+    private fun parseIprp(data: ByteArray, iprpBox: RawBox): IprpData {
+        val subs = parseBoxList(data, iprpBox.payloadOffset, iprpBox.endOffset)
+        val ipco = subs.firstOrNull { it.type == "ipco" }
+            ?: error("iprp without ipco")
+        val ipma = subs.firstOrNull { it.type == "ipma" }
+            ?: error("iprp without ipma")
+
+        // Each child of ipco is a complete property box; preserve as raw bytes.
+        val children = parseBoxList(data, ipco.payloadOffset, ipco.endOffset).map {
+            data.copyOfRange(it.offset.toInt(), it.endOffset.toInt())
+        }
+
+        var p = ipma.payloadOffset.toInt()
+        val ipmaVer = data[p].toInt() and 0xFF
+        val ipmaFlags = ((data[p + 1].toInt() and 0xFF) shl 16) or
+                        ((data[p + 2].toInt() and 0xFF) shl 8) or
+                        (data[p + 3].toInt() and 0xFF)
+        p += 4
+        val ec = readU32(data, p.toLong()).toInt(); p += 4
+        val entries = mutableListOf<IpmaEntry>()
+        repeat(ec) {
+            val itemId = if (ipmaVer < 1) {
+                readU16(data, p.toLong()).toInt().also { p += 2 }
+            } else {
+                readU32(data, p.toLong()).toInt().also { p += 4 }
+            }
+            val n = data[p].toInt() and 0xFF; p += 1
+            val assocs = mutableListOf<IpmaAssoc>()
+            repeat(n) {
+                if ((ipmaFlags and 1) != 0) {
+                    val v = readU16(data, p.toLong()); p += 2
+                    assocs += IpmaAssoc((v ushr 15) == 1, v and 0x7FFF)
+                } else {
+                    val v = data[p].toInt() and 0xFF; p += 1
+                    assocs += IpmaAssoc((v ushr 7) == 1, v and 0x7F)
+                }
+            }
+            entries += IpmaEntry(itemId, assocs)
+        }
+        return IprpData(children, ipmaVer, ipmaFlags, entries)
+    }
+
+    private fun buildIprp(
+        ipcoChildren: List<ByteArray>,
+        ipmaVer: Int, ipmaFlags: Int,
+        ipmaEntries: List<IpmaEntry>
+    ): ByteArray {
+        // Build ipco
+        val ipcoBody = ByteArrayOutputStream()
+        for (c in ipcoChildren) ipcoBody.write(c)
+        val ipcoBox = wrapBox("ipco", ipcoBody.toByteArray())
+
+        // Build ipma
+        val ipmaBody = ByteArrayOutputStream()
+        ipmaBody.write(ipmaVer)
+        ipmaBody.write((ipmaFlags ushr 16) and 0xFF)
+        ipmaBody.write((ipmaFlags ushr 8) and 0xFF)
+        ipmaBody.write(ipmaFlags and 0xFF)
+        writeU32(ipmaBody, ipmaEntries.size.toLong())
+        for (e in ipmaEntries) {
+            if (ipmaVer < 1) writeU16(ipmaBody, e.itemId)
+            else writeU32(ipmaBody, e.itemId.toLong())
+            ipmaBody.write(e.associations.size and 0xFF)
+            for (a in e.associations) {
+                if ((ipmaFlags and 1) != 0) {
+                    val v = ((if (a.essential) 0x8000 else 0) or (a.propertyIndex and 0x7FFF))
+                    writeU16(ipmaBody, v)
+                } else {
+                    val v = ((if (a.essential) 0x80 else 0) or (a.propertyIndex and 0x7F))
+                    ipmaBody.write(v)
+                }
+            }
+        }
+        val ipmaBox = wrapBox("ipma", ipmaBody.toByteArray())
+
+        return wrapBox("iprp", ipcoBox + ipmaBox)
     }
 }
