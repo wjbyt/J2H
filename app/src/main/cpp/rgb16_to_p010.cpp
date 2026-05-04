@@ -53,88 +53,88 @@ inline int clamp10(int v) {
 
 } // namespace
 
+/**
+ * Convert a (possibly partial) tile region of the source bitmap into a P010
+ * buffer of size tileW × tileH. Tile region is [srcX..srcX+tileW) × [srcY..srcY+tileH);
+ * pixels outside the bitmap bounds are clamped to the nearest valid pixel
+ * (edge replication) — used when the tiled grid extends past the image edge.
+ *
+ * Pass srcX=0, srcY=0, tileW=width, tileH=height to convert the whole bitmap.
+ */
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_wjbyt_j2h_heif_TenBitEncoder_nativeRgbaF16ToP010(
         JNIEnv* env, jclass /*clazz*/,
         jobject jBitmap,
         jbyteArray jOutBuffer, jint yPlaneRowStrideBytes, jint uvPlaneRowStrideBytes,
-        jint uvPlaneOffsetInBuffer)
+        jint uvPlaneOffsetInBuffer,
+        jint srcX, jint srcY, jint tileW, jint tileH)
 {
     AndroidBitmapInfo info;
     if (AndroidBitmap_getInfo(env, jBitmap, &info) < 0)
         return env->NewStringUTF("getInfo failed");
     if (info.format != ANDROID_BITMAP_FORMAT_RGBA_F16)
         return env->NewStringUTF("bitmap must be RGBA_F16");
+    if ((tileW & 1) || (tileH & 1))
+        return env->NewStringUTF("tile dims must be even");
+    if (tileW <= 0 || tileH <= 0)
+        return env->NewStringUTF("tile dims must be positive");
 
     void* pixels = nullptr;
     if (AndroidBitmap_lockPixels(env, jBitmap, &pixels) < 0 || pixels == nullptr)
         return env->NewStringUTF("lockPixels failed");
 
-    const int w = (int)info.width;
-    const int h = (int)info.height;
-    const int srcStride = (int)info.stride; // bytes per src row
+    const int srcW = (int)info.width;
+    const int srcH = (int)info.height;
+    const int srcStride = (int)info.stride;
 
-    if ((w & 1) || (h & 1)) {
-        AndroidBitmap_unlockPixels(env, jBitmap);
-        return env->NewStringUTF("dimensions must be even (4:2:0 subsampling)");
-    }
-
-    jsize outLen = env->GetArrayLength(jOutBuffer);
-    if (outLen < uvPlaneOffsetInBuffer + uvPlaneRowStrideBytes * (h / 2)) {
-        AndroidBitmap_unlockPixels(env, jBitmap);
-        return env->NewStringUTF("output buffer too small");
-    }
+    auto clampX = [srcW](int x) { return x < 0 ? 0 : (x >= srcW ? srcW - 1 : x); };
+    auto clampY = [srcH](int y) { return y < 0 ? 0 : (y >= srcH ? srcH - 1 : y); };
 
     jbyte* outBuf = env->GetByteArrayElements(jOutBuffer, nullptr);
     auto* yPlane  = reinterpret_cast<uint8_t*>(outBuf);
     auto* uvPlane = reinterpret_cast<uint8_t*>(outBuf) + uvPlaneOffsetInBuffer;
     const auto* src = static_cast<const uint8_t*>(pixels);
 
-    // Process pixel-pairs: for each 2x2 block compute 4 Y values and one averaged UV.
-    for (int y = 0; y < h; y += 2) {
-        const auto* row0 = reinterpret_cast<const uint16_t*>(src + (size_t)y * srcStride);
-        const auto* row1 = reinterpret_cast<const uint16_t*>(src + (size_t)(y + 1) * srcStride);
+    auto readRGB = [&](int absX, int absY, float& R, float& G, float& B) {
+        int sx = clampX(srcX + absX);
+        int sy = clampY(srcY + absY);
+        const uint16_t* row = reinterpret_cast<const uint16_t*>(src + (size_t)sy * srcStride);
+        R = half_to_float(row[sx * 4 + 0]);
+        G = half_to_float(row[sx * 4 + 1]);
+        B = half_to_float(row[sx * 4 + 2]);
+        if (R < 0.f) R = 0.f; else if (R > 1.f) R = 1.f;
+        if (G < 0.f) G = 0.f; else if (G > 1.f) G = 1.f;
+        if (B < 0.f) B = 0.f; else if (B > 1.f) B = 1.f;
+    };
+
+    for (int y = 0; y < tileH; y += 2) {
         auto* y0 = reinterpret_cast<uint16_t*>(yPlane + (size_t)y * yPlaneRowStrideBytes);
         auto* y1 = reinterpret_cast<uint16_t*>(yPlane + (size_t)(y + 1) * yPlaneRowStrideBytes);
         auto* uvRow = reinterpret_cast<uint16_t*>(uvPlane + (size_t)(y / 2) * uvPlaneRowStrideBytes);
 
-        for (int x = 0; x < w; x += 2) {
+        for (int x = 0; x < tileW; x += 2) {
             float sumCb = 0.f, sumCr = 0.f;
             for (int dy = 0; dy < 2; ++dy) {
-                const uint16_t* r = (dy == 0) ? row0 : row1;
-                uint16_t* yo     = (dy == 0) ? y0 : y1;
+                uint16_t* yo = (dy == 0) ? y0 : y1;
                 for (int dx = 0; dx < 2; ++dx) {
-                    int xi = x + dx;
-                    float R = half_to_float(r[xi * 4 + 0]);
-                    float G = half_to_float(r[xi * 4 + 1]);
-                    float B = half_to_float(r[xi * 4 + 2]);
-                    if (R < 0.f) R = 0.f; else if (R > 1.f) R = 1.f;
-                    if (G < 0.f) G = 0.f; else if (G > 1.f) G = 1.f;
-                    if (B < 0.f) B = 0.f; else if (B > 1.f) B = 1.f;
-
-                    // BT.709 luma weights; chroma in -0.5..+0.5 around 0.
+                    float R, G, B;
+                    readRGB(x + dx, y + dy, R, G, B);
                     float Y  = 0.2126f * R + 0.7152f * G + 0.0722f * B;
                     float Cb = (B - Y) / 1.8556f;
                     float Cr = (R - Y) / 1.5748f;
-
-                    // Limited range 10-bit: Y 64..940, C 64..960.
                     int Y10 = (int)std::lround(Y * 876.0f + 64.0f);
-                    yo[xi] = (uint16_t)(clamp10(Y10) << 6);
-
-                    sumCb += Cb;
-                    sumCr += Cr;
+                    yo[x + dx] = (uint16_t)(clamp10(Y10) << 6);
+                    sumCb += Cb; sumCr += Cr;
                 }
             }
-            // Average chroma over the 2x2 block, then quantize.
             int Cb10 = (int)std::lround((sumCb * 0.25f) * 896.0f + 512.0f);
             int Cr10 = (int)std::lround((sumCr * 0.25f) * 896.0f + 512.0f);
-            int chromaIdx = x; // U at even offset, V at odd offset within row of length w
-            uvRow[chromaIdx + 0] = (uint16_t)(clamp10(Cb10) << 6);
-            uvRow[chromaIdx + 1] = (uint16_t)(clamp10(Cr10) << 6);
+            uvRow[x + 0] = (uint16_t)(clamp10(Cb10) << 6);
+            uvRow[x + 1] = (uint16_t)(clamp10(Cr10) << 6);
         }
     }
 
     AndroidBitmap_unlockPixels(env, jBitmap);
     env->ReleaseByteArrayElements(jOutBuffer, outBuf, 0);
-    return nullptr; // success
+    return nullptr;
 }

@@ -163,13 +163,22 @@ class HeicConverter(
                 existing?.delete()
                 val tmp = File.createTempFile("j2h_10b_", ".heic", context.cacheDir)
                 try {
-                    val err = TenBitEncoder.encode(
+                    // Try single-frame Main10 first; if the encoder rejects the size
+                    // (>~35MP), fall back to grid-tile encoding.
+                    var err = TenBitEncoder.encode(
                         even, tmp.absolutePath, qualityHint = quality,
-                        // Display P3 D65 SDR — primaries=12, transfer=1 (BT.709 SDR
-                        // gamma ~ sRGB, safe for non-HDR viewers), matrix=1 (BT.709
-                        // YUV math). Native YUV conversion uses BT.709 luma weights.
                         colourPrimaries = 12, transferCharacteristics = 1, matrixCoefficients = 1
                     )
+                    if (err != null && err.contains("不支持")) {
+                        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                            "  · 单帧尺寸超限，切换到瓦片网格编码"
+                        )
+                        err = TenBitGridEncoder.encode(
+                            even, tmp.absolutePath, qualityHint = quality,
+                            tileW = 2048, tileH = 2048,
+                            colourPrimaries = 12, transferCharacteristics = 1, matrixCoefficients = 1
+                        )
+                    }
                     if (err != null) return Result.Failed("10-bit 编码失败: $err",
                                                           keepOriginal = true)
 

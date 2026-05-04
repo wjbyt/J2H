@@ -220,7 +220,7 @@ object TenBitEncoder {
         }
 
         val tmp = ByteArray(totalBytes)
-        val err = nativeRgbaF16ToP010(bitmap, tmp, yStride, uvStride, ySize)
+        val err = nativeRgbaF16ToP010(bitmap, tmp, yStride, uvStride, ySize, 0, 0, w, h)
         if (err != null) return err
 
         inBuf.put(tmp, 0, totalBytes)
@@ -231,9 +231,22 @@ object TenBitEncoder {
         return null
     }
 
+    /** Public wrapper used by [TenBitGridEncoder] for per-tile region conversion. */
+    @JvmStatic
+    fun nativeRgbaF16ToP010Public(
+        bitmap: Bitmap, out: ByteArray,
+        yPlaneRowStrideBytes: Int, uvPlaneRowStrideBytes: Int,
+        uvPlaneOffsetInBuffer: Int,
+        srcX: Int, srcY: Int, tileW: Int, tileH: Int
+    ): String? = nativeRgbaF16ToP010(
+        bitmap, out, yPlaneRowStrideBytes, uvPlaneRowStrideBytes,
+        uvPlaneOffsetInBuffer, srcX, srcY, tileW, tileH
+    )
+
     @JvmStatic private external fun nativeRgbaF16ToP010(
         bitmap: Bitmap, out: ByteArray,
         yPlaneRowStrideBytes: Int, uvPlaneRowStrideBytes: Int,
-        uvPlaneOffsetInBuffer: Int
+        uvPlaneOffsetInBuffer: Int,
+        srcX: Int, srcY: Int, tileW: Int, tileH: Int
     ): String?
 }

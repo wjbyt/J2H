@@ -17,6 +17,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/Theme.J2H"
         android:allowBackup="false"
+        android:largeHeap="true"
         android:supportsRtl="true">
 
         <activity
