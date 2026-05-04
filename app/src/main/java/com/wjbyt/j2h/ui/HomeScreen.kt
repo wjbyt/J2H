@@ -150,7 +150,7 @@ fun HomeScreen(
             Spacer(Modifier.height(8.dp))
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp)) {
-                    Text("视频 HEVC 重编码率：${videoPct}% （相对源）",
+                    Text("视频画质：${videoPct} （CQ 恒定画质，文件大小自适应内容）",
                          style = MaterialTheme.typography.titleSmall)
                     Slider(
                         value = videoPct.toFloat(),
@@ -159,7 +159,7 @@ fun HomeScreen(
                         steps = 69,
                         enabled = !state.running
                     )
-                    Text("60% 在 75\" 大屏视觉透明 · 70%+ 完全无差异 · 40% 以下复杂场景可见伪影",
+                    Text("70 ≈ 视觉透明（推荐）· 90+ 完全保真 · 50 以下激进压缩",
                          style = MaterialTheme.typography.bodySmall)
                 }
             }

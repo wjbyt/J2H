@@ -46,14 +46,14 @@ object VideoTranscoder {
     }
 
     /**
-     * @param bitrateRatio AV1 target bitrate as a fraction of source HEVC bitrate.
-     *   0.6 ≈ visually transparent on a 75" TV at normal viewing distance, ~40%
-     *   smaller files. 0.4 saves more but artifacts may show in motion. 0.7-0.8
-     *   essentially indistinguishable from source.
+     * @param qualityPct 0..100 quality target — used as Constant Quality (CQ) level
+     *   when the encoder supports BITRATE_MODE_CQ (most modern HW HEVC encoders do),
+     *   else mapped to a VBR target bitrate as fraction of source. 70 ≈ visually
+     *   transparent for typical phone HDR video, 50 = aggressive, 90+ = preserve.
      */
     fun transcode(
         context: Context, input: DocumentFile, parent: DocumentFile,
-        bitrateRatio: Float = 0.6f
+        qualityPct: Int = 70
     ): Result {
         val srcName = input.name ?: return Result.Failed("no name")
         val baseName = srcName.substringBeforeLast('.', srcName)
@@ -125,14 +125,9 @@ object VideoTranscoder {
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
 
-            val sourceBitrate = if (videoFormat.containsKey(MediaFormat.KEY_BIT_RATE))
-                videoFormat.getInteger(MediaFormat.KEY_BIT_RATE)
-            else (w.toLong() * h * frameRate / 4).toInt() // rough estimate ~0.25 bpp
-            val ratio = bitrateRatio.coerceIn(0.2f, 1.0f)
-            val targetBitrate = (sourceBitrate * ratio).toInt().coerceAtLeast(1_000_000)
-            setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
-            setInteger(MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            // Bitrate / quality mode is decided AFTER we open the codec and query its
+            // EncoderCapabilities (BITRATE_MODE_CQ is encoder-specific). We patch the
+            // format below before configure().
 
             // Copy static HDR metadata.
             if (videoFormat.containsKey(MediaFormat.KEY_HDR_STATIC_INFO)) {
@@ -169,6 +164,47 @@ object VideoTranscoder {
         var inputSurface: android.view.Surface? = null
         try {
             encoder = MediaCodec.createByCodecName(hevcEncoderName)
+            // Decide CQ vs VBR based on encoder capabilities.
+            try {
+                val encCaps = encoder.codecInfo
+                    .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC).encoderCapabilities
+                val cqOk = try {
+                    encCaps.isBitrateModeSupported(
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
+                } catch (_: Throwable) { false }
+
+                if (cqOk) {
+                    val qRange = encCaps.qualityRange
+                    val q = (qRange.lower + (qRange.upper - qRange.lower) *
+                                qualityPct.coerceIn(0, 100) / 100).coerceIn(qRange.lower, qRange.upper)
+                    encoderFormat.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
+                    encoderFormat.setInteger(MediaFormat.KEY_QUALITY, q)
+                    com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                        "  · CQ 模式 质量=$q (encoder range ${qRange.lower}..${qRange.upper})"
+                    )
+                } else {
+                    // Fall back to VBR with a sensible bitrate target derived from the
+                    // qualityPct (interpret as bitrate ratio of source).
+                    val sourceBitrate = if (videoFormat.containsKey(MediaFormat.KEY_BIT_RATE))
+                        videoFormat.getInteger(MediaFormat.KEY_BIT_RATE)
+                    else (w.toLong() * h * frameRate / 4).toInt()
+                    val target = (sourceBitrate * qualityPct.coerceIn(20, 100) / 100)
+                        .coerceAtLeast(1_000_000)
+                    encoderFormat.setInteger(MediaFormat.KEY_BIT_RATE, target)
+                    encoderFormat.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                    com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                        "  · CQ 不支持，回退 VBR 目标码率 ${target / 1000} kbps"
+                    )
+                }
+            } catch (e: Exception) {
+                // If anything goes wrong querying caps, leave format without bitrate
+                // mode set and let the encoder pick a default.
+                com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                    "  · 查询编码器能力失败，使用编码器默认: ${e.message}"
+                )
+            }
             try {
                 encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             } catch (e: Exception) {

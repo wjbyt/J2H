@@ -193,8 +193,8 @@ class ConversionForegroundService : Service() {
 
         val quality = store.qualitySnapshot()
         val videoPct = store.videoBitratePctSnapshot()
-        appendLog("HEIC 质量 = $quality · 视频码率 = ${videoPct}%（相对源 HEVC）")
-        appendLog("编码：JPG → 8bit (HeifWriter) · DNG → 10bit (MediaCodec Main10) · 视频 → HEVC 重编 VBR")
+        appendLog("HEIC 质量 = $quality · 视频画质 = $videoPct (CQ)")
+        appendLog("编码：JPG → 8bit (HeifWriter) · DNG → 10bit (MediaCodec Main10) · 视频 → HEVC CQ")
         if (!com.wjbyt.j2h.heif.TenBitEncoder.isAvailable()) {
             appendLog("⚠ 10-bit native lib 不可用，DNG 会失败")
         }
@@ -217,7 +217,7 @@ class ConversionForegroundService : Service() {
                 if (isVideo) {
                     when (val r = com.wjbyt.j2h.video.VideoTranscoder.transcode(
                         applicationContext, f.file, f.parent,
-                        bitrateRatio = videoPct / 100f
+                        qualityPct = videoPct
                     )) {
                         is com.wjbyt.j2h.video.VideoTranscoder.Result.Ok -> {
                             done++
