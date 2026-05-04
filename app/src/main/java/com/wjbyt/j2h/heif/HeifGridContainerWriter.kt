@@ -133,8 +133,12 @@ class HeifGridContainerWriter(
             val body = ByteArrayOutputStream()
             body.write(byteArrayOf(0, 0, 0, 0)) // version=0
             writeU16(body, numTiles + 1) // entry_count
-            for (id in tileIds) body.write(buildInfe(id, "hvc1"))
-            body.write(buildInfe(gridId, "grid"))
+            // Tiles are hidden — they're components of the grid, not images that
+            // gallery apps should show as separate items. Critical: vivo gallery
+            // also requires this so it doesn't try to interpret tiles as images.
+            for (id in tileIds) body.write(buildInfe(id, "hvc1", hidden = true))
+            // Grid is the displayable primary image.
+            body.write(buildInfe(gridId, "grid", hidden = false))
             wrapBox("iinf", body.toByteArray())
         }
         val irefBox = run {
@@ -242,13 +246,16 @@ class HeifGridContainerWriter(
         return ftyp + metaBox + mdatBox
     }
 
-    private fun buildInfe(itemId: Int, type4cc: String): ByteArray {
+    private fun buildInfe(itemId: Int, type4cc: String, hidden: Boolean = false): ByteArray {
         val b = ByteArrayOutputStream()
-        b.write(byteArrayOf(2, 0, 0, 0)) // version=2, flags=0
+        // version=2, flags: bit 0 = "item is hidden" per ISO/IEC 14496-12 §8.11.6.
+        // Hidden items aren't independently displayable; readers find them via iref.
+        val flagByte = if (hidden) 1 else 0
+        b.write(byteArrayOf(2, 0, 0, flagByte.toByte()))
         writeU16(b, itemId)
-        writeU16(b, 0) // protection_index
+        writeU16(b, 0)
         b.write(type4cc.toByteArray(Charsets.US_ASCII))
-        b.write(0)     // empty item_name + null terminator
+        b.write(0)
         return wrapBox("infe", b.toByteArray())
     }
 

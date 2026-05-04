@@ -57,7 +57,9 @@ object HeifExifInjector {
         // ----- Build new sub-box bytes (sizes are deterministic) -----
         val newIinfBytes = buildIinf(
             parsedIinf.version,
-            parsedIinf.entries + IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "")
+            // flags=1 ⇒ "item is hidden" — Samsung's HEIC sets this on its Exif item;
+            // vivo's gallery ignores Exif items that don't have the hidden flag set.
+            parsedIinf.entries + IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "", flags = 1)
         )
         val newIrefBytes = buildIref(
             iref.version,
@@ -284,7 +286,11 @@ object HeifExifInjector {
 
     // ---------- iinf ----------
 
-    data class IinfEntry(val itemId: Int, val itemType: String, val itemName: String)
+    data class IinfEntry(
+        val itemId: Int, val itemType: String, val itemName: String,
+        /** infe box flags (24-bit). bit 0 = "item is hidden". */
+        val flags: Int = 0
+    )
     data class IinfData(val version: Int, val entries: List<IinfEntry>)
 
     private fun parseIinf(data: ByteArray, box: RawBox): IinfData {
@@ -304,6 +310,10 @@ object HeifExifInjector {
             val entryType = readType(data, p + 4L)
             require(entryType == "infe") { "iinf contains non-infe box: $entryType" }
             val infeVer = data[p + 8].toInt() and 0xFF
+            // 3-byte flags follow the version byte.
+            val flagsValue = ((data[p + 9].toInt() and 0xFF) shl 16) or
+                             ((data[p + 10].toInt() and 0xFF) shl 8) or
+                             (data[p + 11].toInt() and 0xFF)
             var q = p + 12 // version+flags consumed
             val itemId: Int
             val itemType: String
@@ -326,7 +336,7 @@ object HeifExifInjector {
                 val nameEnd = indexOfNull(data, q, p + entrySize)
                 itemName = String(data, q, nameEnd - q, Charsets.UTF_8)
             }
-            entries += IinfEntry(itemId, itemType, itemName)
+            entries += IinfEntry(itemId, itemType, itemName, flags = flagsValue)
             p += entrySize
         }
         return IinfData(version, entries)
@@ -345,7 +355,13 @@ object HeifExifInjector {
         // Use version 2 (uint16 item_id) for compactness; supports 4cc item_type.
         val infeVer = if (e.itemId > 0xFFFF) 3 else 2
         val body = ByteArrayOutputStream()
-        body.write(byteArrayOf(infeVer.toByte(), 0, 0, 0))
+        // version + 24-bit flags (bit 0 = hidden). Preserve flags from source so we
+        // don't accidentally unset hidden bits the original encoder set on its tiles.
+        val f = e.flags
+        body.write(infeVer)
+        body.write((f ushr 16) and 0xFF)
+        body.write((f ushr 8) and 0xFF)
+        body.write(f and 0xFF)
         if (infeVer == 2) writeU16(body, e.itemId) else writeU32(body, e.itemId.toLong())
         writeU16(body, 0) // protection_index
         body.write(if (e.itemType.isEmpty()) "    ".toByteArray(Charsets.US_ASCII)
