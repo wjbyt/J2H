@@ -43,7 +43,8 @@ class MainActivity : ComponentActivity() {
                             pickTreeLauncher.launch(null)
                         },
                         onStart = { startService(Intent(this, ConversionForegroundService::class.java).setAction(ConversionForegroundService.ACTION_START)) },
-                        onStop = { startService(Intent(this, ConversionForegroundService::class.java).setAction(ConversionForegroundService.ACTION_STOP)) }
+                        onStop = { startService(Intent(this, ConversionForegroundService::class.java).setAction(ConversionForegroundService.ACTION_STOP)) },
+                        onRepair = { startService(Intent(this, ConversionForegroundService::class.java).setAction(ConversionForegroundService.ACTION_REPAIR)) }
                     )
                 }
             }

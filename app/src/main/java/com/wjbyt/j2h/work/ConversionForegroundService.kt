@@ -33,6 +33,7 @@ class ConversionForegroundService : Service() {
     companion object {
         const val ACTION_START = "com.wjbyt.j2h.START"
         const val ACTION_STOP = "com.wjbyt.j2h.STOP"
+        const val ACTION_REPAIR = "com.wjbyt.j2h.REPAIR"
         private const val CHANNEL_ID = "conversion"
         private const val NOTIF_ID = 1001
 
@@ -73,6 +74,7 @@ class ConversionForegroundService : Service() {
                 stopWork()
                 return START_NOT_STICKY
             }
+            ACTION_REPAIR -> startRepair()
             else -> startWork()
         }
         return START_STICKY
@@ -129,6 +131,67 @@ class ConversionForegroundService : Service() {
     private fun updateNotification(text: String, progress: Int, max: Int) {
         val nm = getSystemService(NotificationManager::class.java)
         nm.notify(NOTIF_ID, buildNotification(text, progress, max))
+    }
+
+    private fun startRepair() {
+        if (job?.isActive == true) return
+        goForeground("准备修复元数据…")
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "J2H::repair").apply {
+            setReferenceCounted(false); acquire(30 * 60 * 1000L)
+        }
+        job = scope.launch {
+            try { runRepair() }
+            finally {
+                wakeLock?.let { if (it.isHeld) it.release() }
+                wakeLock = null
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
+    private suspend fun runRepair() {
+        _state.value = State(running = true)
+        val store = TreeUriStore(applicationContext)
+        val uris = store.snapshot()
+        if (uris.isEmpty()) { appendLog("没有目录可修复"); return }
+        appendLog("扫描 ${uris.size} 个目录的 .heic 文件…")
+        val files = mutableListOf<JpgScanner.Found>()
+        for (u in uris) files += JpgScanner.scan(applicationContext, u)
+        val heicFiles = files.filter { it.file.name?.lowercase()?.endsWith(".heic") == true }
+        if (heicFiles.isEmpty()) { appendLog("未发现 HEIC 文件"); return }
+        _state.value = _state.value.copy(total = heicFiles.size)
+        appendLog("共发现 ${heicFiles.size} 张 HEIC，开始修复元数据…")
+
+        var ok = 0; var skipped = 0; var failed = 0; var totalPatched = 0
+        for ((idx, f) in heicFiles.withIndex()) {
+            if (!currentCoroutineContext().isActive) break
+            val name = f.file.name ?: "?"
+            _state.value = _state.value.copy(current = name)
+            updateNotification("修复 ($idx/${heicFiles.size}): $name", idx, heicFiles.size)
+            try {
+                when (val r = com.wjbyt.j2h.heif.HeicMetadataRepair.repair(applicationContext, f.file)) {
+                    is com.wjbyt.j2h.heif.HeicMetadataRepair.Result.Ok -> {
+                        ok++; totalPatched += r.patchedItems
+                        appendLog("✓ $name 修复 ${r.patchedItems} 个 item flags")
+                    }
+                    is com.wjbyt.j2h.heif.HeicMetadataRepair.Result.Skipped -> {
+                        skipped++
+                    }
+                    is com.wjbyt.j2h.heif.HeicMetadataRepair.Result.Failed -> {
+                        failed++
+                        appendLog("✗ $name 失败：${r.reason}")
+                    }
+                }
+            } catch (e: Throwable) {
+                failed++
+                appendLog("✗ $name 异常：${e.javaClass.simpleName} ${e.message}")
+            }
+            _state.value = _state.value.copy(done = ok, failed = failed, skipped = skipped)
+        }
+        appendLog("==== 修复完成：成功 $ok（共改 $totalPatched 个 flag），无需修改 $skipped，失败 $failed ====")
+        _state.value = _state.value.copy(running = false, current = "")
     }
 
     private fun startWork() {

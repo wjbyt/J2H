@@ -57,7 +57,8 @@ import kotlinx.coroutines.launch
 fun HomeScreen(
     onPickFolder: ((Uri) -> Unit) -> Unit,
     onStart: () -> Unit,
-    onStop: () -> Unit
+    onStop: () -> Unit,
+    onRepair: () -> Unit
 ) {
     val ctx = LocalContext.current
     val store = remember { TreeUriStore(ctx) }
@@ -125,6 +126,12 @@ fun HomeScreen(
                     modifier = Modifier.weight(1f)
                 ) { Text(stringFrom(R.string.stop)) }
             }
+            Spacer(Modifier.height(4.dp))
+            OutlinedButton(
+                onClick = onRepair,
+                enabled = !state.running && uris.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("修复已转换 HEIC 的元数据（不重编码）") }
 
             Spacer(Modifier.height(8.dp))
             Text(stringFrom(R.string.warning_destructive),
