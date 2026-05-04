@@ -220,6 +220,37 @@ object VideoTranscoder {
 
             muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
+            // Preserve metadata that gallery apps display: rotation + GPS.
+            // MediaMuxer doesn't copy these from the source automatically.
+            try {
+                val rotation = if (videoFormat.containsKey(MediaFormat.KEY_ROTATION))
+                    videoFormat.getInteger(MediaFormat.KEY_ROTATION) else 0
+                if (rotation != 0) muxer.setOrientationHint(rotation)
+            } catch (_: Throwable) {}
+            try {
+                val mmr = android.media.MediaMetadataRetriever()
+                try {
+                    mmr.setDataSource(context, input.uri)
+                    // ISO 6709 format: "+ddd.dddd+ddd.dddd[+aa.aaa]/"
+                    val loc = mmr.extractMetadata(
+                        android.media.MediaMetadataRetriever.METADATA_KEY_LOCATION)
+                    if (!loc.isNullOrEmpty()) {
+                        // Parse two signed decimal numbers; ignore optional altitude.
+                        val re = Regex("([+\\-]\\d+\\.?\\d*)([+\\-]\\d+\\.?\\d*)")
+                        re.find(loc)?.let { m ->
+                            val lat = m.groupValues[1].toFloatOrNull()
+                            val lon = m.groupValues[2].toFloatOrNull()
+                            if (lat != null && lon != null) {
+                                muxer.setLocation(lat, lon)
+                                com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                                    "  · 视频 GPS 透传: $lat, $lon"
+                                )
+                            }
+                        }
+                    }
+                } finally { mmr.release() }
+            } catch (_: Throwable) {}
+
             extractor.selectTrack(videoTrack)
 
             val info = MediaCodec.BufferInfo()
