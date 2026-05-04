@@ -125,12 +125,12 @@ class HeicConverter(
             ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 decoder.isMutableRequired = false
-                // BT.2020 wide-gamut target — ImageDecoder maps DNG sensor RGB into
-                // BT.2020 primaries; we then encode YUV with the BT.2020 matrix and
-                // tag the colr/nclx box with primaries=9 / matrix=9 so consumers
-                // render with the wide gamut intent.
+                // Display P3 — wider than sRGB (covers ~96% of camera gamut), narrower
+                // than BT.2020 (so non-color-managed viewers don't see washed-out
+                // results from over-wide primaries). This is what iPhone/Apple HEIC
+                // uses for SDR wide-gamut photos.
                 decoder.setTargetColorSpace(android.graphics.ColorSpace.get(
-                    android.graphics.ColorSpace.Named.BT2020))
+                    android.graphics.ColorSpace.Named.DISPLAY_P3))
             }
         } catch (e: Exception) { return Result.Failed("DNG 解码失败: ${e.message}") }
 
@@ -161,11 +161,10 @@ class HeicConverter(
                 try {
                     val err = TenBitEncoder.encode(
                         even, tmp.absolutePath, qualityHint = quality,
-                        // BT.2020 NCL — primaries=9, transfer=1 (BT.709 SDR gamma is
-                        // visually closest to sRGB; BT.2020 transfer 14/15 is for
-                        // strict broadcast HDR which most viewers don't render
-                        // correctly), matrix=9, limited range.
-                        colourPrimaries = 9, transferCharacteristics = 1, matrixCoefficients = 9
+                        // Display P3 D65 SDR — primaries=12, transfer=1 (BT.709 SDR
+                        // gamma ~ sRGB, safe for non-HDR viewers), matrix=1 (BT.709
+                        // YUV math). Native YUV conversion uses BT.709 luma weights.
+                        colourPrimaries = 12, transferCharacteristics = 1, matrixCoefficients = 1
                     )
                     if (err != null) return Result.Failed("10-bit 编码失败: $err",
                                                           keepOriginal = true)

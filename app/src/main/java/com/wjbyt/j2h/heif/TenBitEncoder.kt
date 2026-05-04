@@ -73,9 +73,11 @@ object TenBitEncoder {
             setInteger(MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-            // Tell the encoder the input pixels are in BT.2020 primaries with SDR
-            // transfer; matches the colr/nclx box we emit.
-            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
+            // We feed Display P3 RGB through BT.709 YUV math; KEY_COLOR_STANDARD here
+            // is the matrix space for the YUV conversion (which the encoder may use
+            // for internal optimisations) — BT709 matches our native math. The wide
+            // gamut intent is recorded separately in the HEIF colr/nclx box.
+            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         }
 
