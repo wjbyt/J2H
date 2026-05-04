@@ -200,7 +200,7 @@ class ConversionForegroundService : Service() {
                 when (val r = converter.convert(f.file, f.parent)) {
                     is HeicConverter.Result.Ok -> {
                         done++
-                        appendLog("✓ $name → ${r.outName} (${r.bytesIn / 1024}KB → ${r.bytesOut / 1024}KB)")
+                        appendLog("✓ $name → ${r.outName} ${r.bytesIn / 1024}KB→${r.bytesOut / 1024}KB · ${r.encoder}")
                     }
                     is HeicConverter.Result.Skipped -> {
                         skipped++
