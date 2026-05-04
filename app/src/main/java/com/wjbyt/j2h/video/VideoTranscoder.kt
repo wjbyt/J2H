@@ -212,7 +212,7 @@ object VideoTranscoder {
                 if (!encoderInputDone) {
                     val outIdx = decoder.dequeueOutputBuffer(info, 0L)
                     when {
-                        outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED,
+                        outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ||
                         outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                             /* nothing to do */
                         }
