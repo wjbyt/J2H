@@ -21,7 +21,14 @@ import java.nio.ByteOrder
  */
 object HeifExifInjector {
 
-    fun inject(heicData: ByteArray, exifTiff: ByteArray): ByteArray {
+    fun inject(heicData: ByteArray, exifTiff: ByteArray): ByteArray =
+        inject(heicData, exifTiff, thumb = null)
+
+    fun inject(
+        heicData: ByteArray,
+        exifTiff: ByteArray,
+        thumb: ThumbnailGenerator.Thumb?
+    ): ByteArray {
         require(heicData.size >= 16) { "HEIC data too short" }
 
         val topBoxes = parseTopLevel(heicData)
@@ -43,8 +50,10 @@ object HeifExifInjector {
             ?: error("No iinf box")
         val parsedIinf = parseIinf(heicData, iinfBox)
 
-        val newItemId = ((parsedIinf.entries.maxOfOrNull { it.itemId } ?: 0) + 1)
+        val baseNewId = ((parsedIinf.entries.maxOfOrNull { it.itemId } ?: 0) + 1)
             .coerceAtLeast(primaryItemId + 1)
+        val newItemId = baseNewId
+        val thumbItemId = if (thumb != null) baseNewId + 1 else 0
 
         val ilocBox = subBoxes.firstOrNull { it.type == "iloc" }
             ?: error("No iloc box")
@@ -54,57 +63,96 @@ object HeifExifInjector {
         val iref = irefBox?.let { parseIref(heicData, it) }
             ?: IrefData(version = 0, refs = mutableListOf())
 
-        // ----- iprp augmentation: add irot=0 box + associate to primary -----
-        // Samsung-format HEIC has irot in ipco and associates it with the primary
-        // image via ipma. vivo's gallery requires this association before it
-        // considers the file 'a phone photo' worth extracting EXIF from.
+        // ----- iprp augmentation -----
+        // Add (a) irot box associated with the primary image, and (b) when a
+        // thumbnail bitstream is provided, the thumb's hvcC + ispe + irot props
+        // and an ipma entry binding them to the new thumbnail item.
+        // vivo's gallery requires this Samsung-style structure before it
+        // surfaces EXIF.
         val iprpBox = subBoxes.firstOrNull { it.type == "iprp" }
         val newIprpBytes: ByteArray? = iprpBox?.let { ipBox ->
             val parsed = parseIprp(heicData, ipBox)
-            // Skip if irot already exists in ipco.
-            val hasIrot = parsed.ipcoChildren.any {
-                it.size >= 8 &&
-                it[4] == 'i'.code.toByte() && it[5] == 'r'.code.toByte() &&
+            val children = parsed.ipcoChildren.toMutableList()
+            val ipma = parsed.ipmaEntries.toMutableList()
+
+            // Grid irot
+            val hasIrot = children.any {
+                it.size >= 8 && it[4] == 'i'.code.toByte() && it[5] == 'r'.code.toByte() &&
                 it[6] == 'o'.code.toByte() && it[7] == 't'.code.toByte()
             }
-            if (hasIrot) {
-                null
-            } else {
-                val irotBox = wrapBox("irot", byteArrayOf(0x00))
-                val newIpcoChildren = parsed.ipcoChildren + irotBox
-                val newIrotIndex = newIpcoChildren.size // 1-based
-                val newIpmaEntries = parsed.ipmaEntries.map { e ->
-                    if (e.itemId == primaryItemId)
-                        e.copy(associations = e.associations + IpmaAssoc(essential = true, propertyIndex = newIrotIndex))
-                    else e
+            var changed = false
+            if (!hasIrot) {
+                children += wrapBox("irot", byteArrayOf(0x00))
+                val irotIdx = children.size
+                for ((i, e) in ipma.withIndex()) {
+                    if (e.itemId == primaryItemId) {
+                        ipma[i] = e.copy(associations = e.associations +
+                            IpmaAssoc(essential = true, propertyIndex = irotIdx))
+                    }
                 }
-                buildIprp(newIpcoChildren, parsed.ipmaVersion, parsed.ipmaFlags, newIpmaEntries)
+                changed = true
             }
+
+            // Thumbnail's three properties + ipma entry, if thumbnail provided.
+            if (thumb != null) {
+                children += wrapBox("hvcC", thumb.hvcC)
+                val thumbHvcCIdx = children.size
+                val ispeBody = ByteArrayOutputStream().apply {
+                    write(byteArrayOf(0, 0, 0, 0))                  // version+flags
+                    writeU32(this, thumb.width.toLong())
+                    writeU32(this, thumb.height.toLong())
+                }
+                children += wrapBox("ispe", ispeBody.toByteArray())
+                val thumbIspeIdx = children.size
+                children += wrapBox("irot", byteArrayOf(0x00))
+                val thumbIrotIdx = children.size
+
+                ipma += IpmaEntry(
+                    itemId = thumbItemId,
+                    associations = listOf(
+                        IpmaAssoc(true, thumbHvcCIdx),
+                        IpmaAssoc(true, thumbIspeIdx),
+                        IpmaAssoc(true, thumbIrotIdx)
+                    )
+                )
+                changed = true
+            }
+
+            if (changed)
+                buildIprp(children, parsed.ipmaVersion, parsed.ipmaFlags, ipma)
+            else null
         }
 
         // ----- Build new sub-box bytes (sizes are deterministic) -----
-        val newIinfBytes = buildIinf(
-            parsedIinf.version,
-            // flags=1 ⇒ "item is hidden" — Samsung's HEIC sets this on its Exif item;
-            // vivo's gallery ignores Exif items that don't have the hidden flag set.
-            parsedIinf.entries + IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "", flags = 1)
-        )
-        val newIrefBytes = buildIref(
-            iref.version,
-            iref.refs + IrefEntry("cdsc", newItemId, listOf(primaryItemId))
-        )
+        val newIinfEntries = parsedIinf.entries.toMutableList()
+        newIinfEntries += IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "", flags = 1)
+        if (thumb != null) {
+            newIinfEntries += IinfEntry(itemId = thumbItemId, itemType = "hvc1", itemName = "", flags = 1)
+        }
+        val newIinfBytes = buildIinf(parsedIinf.version, newIinfEntries)
+
+        val newRefs = iref.refs.toMutableList()
+        if (thumb != null) {
+            // Match Samsung iref order: ..dimg, thmb, cdsc..
+            newRefs += IrefEntry("thmb", thumbItemId, listOf(primaryItemId))
+        }
+        newRefs += IrefEntry("cdsc", newItemId, listOf(primaryItemId))
+        val newIrefBytes = buildIref(iref.version, newRefs)
 
         // We build iloc twice: first with placeholder offsets to learn size,
         // then with real offsets once we know meta growth.
-        val placeholderIloc = iloc.copy(
-            entries = iloc.entries + IlocEntry(
-                itemId = newItemId,
-                constructionMethod = 0,
-                dataReferenceIndex = 0,
-                baseOffset = 0,
-                extents = listOf(IlocExtent(extentIndex = 0, extentOffset = 0, extentLength = 0))
-            )
+        val placeholderEntries = mutableListOf<IlocEntry>()
+        placeholderEntries += IlocEntry(
+            itemId = newItemId, constructionMethod = 0, dataReferenceIndex = 0,
+            baseOffset = 0, extents = listOf(IlocExtent(0, 0, 0))
         )
+        if (thumb != null) {
+            placeholderEntries += IlocEntry(
+                itemId = thumbItemId, constructionMethod = 0, dataReferenceIndex = 0,
+                baseOffset = 0, extents = listOf(IlocExtent(0, 0, 0))
+            )
+        }
+        val placeholderIloc = iloc.copy(entries = iloc.entries + placeholderEntries)
         val newIlocSizePredicted = buildIloc(placeholderIloc).size
 
         val oldIinfSize = iinfBox.size.toInt()
@@ -135,75 +183,67 @@ object HeifExifInjector {
             .put(exifTiff)
             .array()
 
-        // ----- Build final iloc with shifted offsets and the new entry -----
-        val shiftedEntries = iloc.entries.map { entry ->
+        val thumbBlockOffset = exifBlockOffset + exifBlock.size
+        val thumbBytes = thumb?.bitstream ?: ByteArray(0)
+
+        // ----- Build final iloc with shifted offsets and the new entries -----
+        fun shifted(entries: List<IlocEntry>, extra: Long): List<IlocEntry> = entries.map { entry ->
             if (entry.constructionMethod == 0) {
-                // Absolute file offsets; mdat moved by `delta`.
                 if (iloc.baseOffsetSize > 0) {
-                    entry.copy(baseOffset = entry.baseOffset + delta)
+                    entry.copy(baseOffset = entry.baseOffset + extra)
                 } else {
                     entry.copy(extents = entry.extents.map {
-                        it.copy(extentOffset = it.extentOffset + delta)
+                        it.copy(extentOffset = it.extentOffset + extra)
                     })
                 }
             } else entry
         }
-        val newEntry = IlocEntry(
-            itemId = newItemId,
-            constructionMethod = 0,
-            dataReferenceIndex = 0,
-            baseOffset = if (iloc.baseOffsetSize > 0) exifBlockOffset else 0L,
-            extents = listOf(
-                IlocExtent(
-                    extentIndex = 0,
-                    extentOffset = if (iloc.baseOffsetSize > 0) 0L else exifBlockOffset,
-                    extentLength = exifBlock.size.toLong()
-                )
+        fun makeEntry(itemId: Int, off: Long, len: Long, useBaseOffset: Boolean): IlocEntry =
+            IlocEntry(
+                itemId = itemId,
+                constructionMethod = 0,
+                dataReferenceIndex = 0,
+                baseOffset = if (useBaseOffset) off else 0L,
+                extents = listOf(IlocExtent(0,
+                    if (useBaseOffset) 0L else off, len))
             )
-        )
-        val finalIloc = iloc.copy(entries = shiftedEntries + newEntry)
 
-        // If predicted iloc field widths are too small to hold our new offset, upgrade.
-        val finalIlocAdjusted = upgradeIlocFieldSizes(finalIloc, exifBlockOffset, exifBlock.size.toLong())
+        val useBO = iloc.baseOffsetSize > 0
+        val shiftedEntries = shifted(iloc.entries, delta.toLong())
+        val exifEntry = makeEntry(newItemId, exifBlockOffset, exifBlock.size.toLong(), useBO)
+        val newEntries = mutableListOf<IlocEntry>().apply {
+            add(exifEntry)
+            if (thumb != null) add(makeEntry(thumbItemId, thumbBlockOffset,
+                                              thumbBytes.size.toLong(), useBO))
+        }
+        val finalIloc = iloc.copy(entries = shiftedEntries + newEntries)
+
+        val maxOffset = maxOf(exifBlockOffset, thumbBlockOffset)
+        val maxLength = maxOf(exifBlock.size.toLong(), thumbBytes.size.toLong())
+        val finalIlocAdjusted = upgradeIlocFieldSizes(finalIloc, maxOffset, maxLength)
         val newIlocBytes = buildIloc(finalIlocAdjusted)
 
-        // If field-size upgrade changed iloc size, recompute everything.
         if (newIlocBytes.size != newIlocSizePredicted) {
             val growth = newIlocBytes.size - newIlocSizePredicted
-            // Shift new exif offset by growth and rebuild
-            val newExifOffset = exifBlockOffset + growth
-            val reShifted = iloc.entries.map { entry ->
-                if (entry.constructionMethod == 0) {
-                    if (iloc.baseOffsetSize > 0) {
-                        entry.copy(baseOffset = entry.baseOffset + delta + growth)
-                    } else {
-                        entry.copy(extents = entry.extents.map {
-                            it.copy(extentOffset = it.extentOffset + delta + growth)
-                        })
-                    }
-                } else entry
+            val newExifOff = exifBlockOffset + growth
+            val newThumbOff = thumbBlockOffset + growth
+            val reShifted = shifted(iloc.entries, (delta + growth).toLong())
+            val useBO2 = finalIlocAdjusted.baseOffsetSize > 0
+            val reExif = makeEntry(newItemId, newExifOff, exifBlock.size.toLong(), useBO2)
+            val reEntries = mutableListOf<IlocEntry>().apply {
+                add(reExif)
+                if (thumb != null) add(makeEntry(thumbItemId, newThumbOff,
+                                                  thumbBytes.size.toLong(), useBO2))
             }
-            val reNewEntry = newEntry.copy(
-                baseOffset = if (finalIlocAdjusted.baseOffsetSize > 0) newExifOffset else 0L,
-                extents = listOf(
-                    IlocExtent(
-                        extentIndex = 0,
-                        extentOffset = if (finalIlocAdjusted.baseOffsetSize > 0) 0L else newExifOffset,
-                        extentLength = exifBlock.size.toLong()
-                    )
-                )
-            )
-            val rebuilt = finalIlocAdjusted.copy(entries = reShifted + reNewEntry)
+            val rebuilt = finalIlocAdjusted.copy(entries = reShifted + reEntries)
             val rebuiltBytes = buildIloc(rebuilt)
-            require(rebuiltBytes.size == newIlocBytes.size) {
-                "iloc size unstable after upgrade"
-            }
+            require(rebuiltBytes.size == newIlocBytes.size) { "iloc size unstable after upgrade" }
             return assemble(
                 heicData, topBoxes, metaIdx, metaBox, subBoxes,
                 newIinfBytes, newIrefBytes, irefBox, rebuiltBytes,
                 newIprpBytes,
                 newMetaSizeWithGrowth(newMetaSize, growth),
-                exifBlock
+                exifBlock, thumbBytes
             )
         }
 
@@ -211,7 +251,7 @@ object HeifExifInjector {
             heicData, topBoxes, metaIdx, metaBox, subBoxes,
             newIinfBytes, newIrefBytes, irefBox, newIlocBytes,
             newIprpBytes,
-            newMetaSize, exifBlock
+            newMetaSize, exifBlock, thumbBytes
         )
     }
 
@@ -229,7 +269,8 @@ object HeifExifInjector {
         newIlocBytes: ByteArray,
         newIprpBytes: ByteArray?,
         newMetaSize: Int,
-        exifBlock: ByteArray
+        exifBlock: ByteArray,
+        thumbBytes: ByteArray
     ): ByteArray {
         val newMetaPayload = ByteArrayOutputStream()
         // version+flags of meta FullBox
@@ -264,8 +305,9 @@ object HeifExifInjector {
         for (i in metaIdx + 1 until topBoxes.size) {
             out.write(src, topBoxes[i].offset.toInt(), topBoxes[i].size.toInt())
         }
-        // Exif blob
+        // Exif blob, then thumb bitstream (in this order so iloc offsets match).
         out.write(exifBlock)
+        if (thumbBytes.isNotEmpty()) out.write(thumbBytes)
         return out.toByteArray()
     }
 

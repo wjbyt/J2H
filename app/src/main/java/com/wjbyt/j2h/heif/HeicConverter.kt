@@ -98,11 +98,22 @@ class HeicConverter(
             existing?.delete()
             val hwBytes = try { encodeViaHeifWriter(bitmap) }
                 catch (e: Exception) { return Result.Failed("HeifWriter 编码失败: ${e.message}") }
+
+            // Generate a small thumbnail item — vivo gallery wants this present
+            // before it surfaces EXIF for a HEIC.
+            val thumbnail = try {
+                ThumbnailGenerator.generate(context, bitmap, maxDim = 320)
+            } catch (e: Exception) {
+                com.wjbyt.j2h.work.ConversionForegroundService
+                    .appendLog("  · 缩略图生成失败（继续）: ${e.message}")
+                null
+            }
+
             val finalBytes = if (exifTiff != null && exifTiff.isNotEmpty()) {
-                try { HeifExifInjector.inject(hwBytes, exifTiff) }
+                try { HeifExifInjector.inject(hwBytes, exifTiff, thumbnail) }
                 catch (e: Exception) {
                     com.wjbyt.j2h.work.ConversionForegroundService
-                        .appendLog("  · EXIF 注入异常（保留无 EXIF 输出）: ${e.message}")
+                        .appendLog("  · EXIF/缩略图 注入异常: ${e.message}")
                     hwBytes
                 }
             } else hwBytes
