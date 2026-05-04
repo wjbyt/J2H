@@ -194,7 +194,7 @@ class ConversionForegroundService : Service() {
         val quality = store.qualitySnapshot()
         val videoPct = store.videoBitratePctSnapshot()
         appendLog("HEIC 质量 = $quality · 视频码率 = ${videoPct}%（相对源 HEVC）")
-        appendLog("编码：JPG → 8bit (HeifWriter) · DNG → 10bit (MediaCodec Main10) · 视频 → AV1")
+        appendLog("编码：JPG → 8bit (HeifWriter) · DNG → 10bit (MediaCodec Main10) · 视频 → HEVC 重编 VBR")
         if (!com.wjbyt.j2h.heif.TenBitEncoder.isAvailable()) {
             appendLog("⚠ 10-bit native lib 不可用，DNG 会失败")
         }
@@ -204,9 +204,10 @@ class ConversionForegroundService : Service() {
             if (!currentCoroutineContext().isActive) break
             val name = f.file.name ?: "?"
             val lower = name.lowercase()
-            val isVideo = (lower.endsWith(".mp4") || lower.endsWith(".mov")) && !lower.endsWith(".av1.mp4")
+            val isVideo = (lower.endsWith(".mp4") || lower.endsWith(".mov")) &&
+                          !lower.endsWith(".compressed.mp4") && !lower.endsWith(".av1.mp4")
             val tag = when {
-                isVideo -> "[VID→AV1  ]"
+                isVideo -> "[VID→HEVC ]"
                 lower.endsWith(".dng") -> "[DNG→10bit]"
                 else -> "[JPG→8bit ]"
             }

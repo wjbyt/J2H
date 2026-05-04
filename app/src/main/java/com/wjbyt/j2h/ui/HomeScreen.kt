@@ -150,7 +150,7 @@ fun HomeScreen(
             Spacer(Modifier.height(8.dp))
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp)) {
-                    Text("视频 AV1 码率：${videoPct}% （相对源 HEVC）",
+                    Text("视频 HEVC 重编码率：${videoPct}% （相对源）",
                          style = MaterialTheme.typography.titleSmall)
                     Slider(
                         value = videoPct.toFloat(),

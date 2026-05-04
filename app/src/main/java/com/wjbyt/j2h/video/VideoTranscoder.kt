@@ -12,31 +12,30 @@ import androidx.documentfile.provider.DocumentFile
 import java.nio.ByteBuffer
 
 /**
- * HEVC video → AV1 video, surface-to-surface hardware transcoding.
+ * HEVC video → HEVC video re-encode, surface-to-surface hardware transcoding.
+ * (Originally targeted AV1 but vivo X200 Ultra doesn't expose hardware AV1
+ *  encoder via MediaCodec — only software fallback. HEVC→HEVC at lower bitrate
+ *  is the practical hardware-speed path.)
  *
  * Pipeline:
  *   MediaExtractor (input mp4)
- *     ├── video: HEVC samples → MediaCodec HEVC decoder
+ *     ├── video: HEVC/DV samples → MediaCodec decoder
  *     │                            (configured with encoder.inputSurface)
  *     │                          ↓ Surface (GPU)
- *     │                       MediaCodec AV1 encoder
+ *     │                       MediaCodec HEVC encoder (Main10 if HDR, else Main)
  *     │                          ↓
  *     │                       MediaMuxer (mp4 output)
  *     │
- *     └── audio: AAC/etc samples copied byte-for-byte to muxer (no transcode)
+ *     └── audio: AAC/etc samples copied byte-for-byte (no transcode)
  *
  * HDR preservation:
  *   - Static metadata (KEY_HDR_STATIC_INFO, color primaries/transfer/matrix/range)
- *     copied from input MediaFormat to encoder MediaFormat.
- *   - HDR10+ dynamic metadata extracted per-decoded-frame from
- *     decoder.getOutputFormat(idx)[KEY_HDR10_PLUS_INFO] and forwarded to the
- *     encoder via setParameters() right before releaseOutputBuffer(idx, true).
- *   - Dolby Vision RPU: not preserved (no public AV1 DV path) — falls back to
- *     HDR10/HDR10+ which the base layer already encodes.
- *
- * Requires hardware AV1 encoder; on devices without one (most non-flagship
- * phones), MediaCodec.createEncoderByType("video/av01") will fail and we
- * return Failed without touching the source file.
+ *     copied from input format to encoder format.
+ *   - HDR10+ per-frame dynamic metadata extracted from decoder.getOutputFormat
+ *     (idx)[KEY_HDR10_PLUS_INFO] and forwarded to the encoder via setParameters()
+ *     right before releaseOutputBuffer(idx, true).
+ *   - Dolby Vision RPU layer: dropped — Android exposes no public DV encoder
+ *     path for third-party apps. Base-layer HDR10 / HDR10+ is preserved.
  */
 object VideoTranscoder {
 
@@ -58,7 +57,7 @@ object VideoTranscoder {
     ): Result {
         val srcName = input.name ?: return Result.Failed("no name")
         val baseName = srcName.substringBeforeLast('.', srcName)
-        val targetName = "$baseName.av1.mp4"
+        val targetName = "$baseName.compressed.mp4"
 
         val existing = parent.findFile(targetName)
         if (existing != null && existing.length() > 0) return Result.Skipped("$targetName 已存在")
@@ -97,14 +96,16 @@ object VideoTranscoder {
             return Result.Failed("仅支持 HEVC 或 DV 输入（实际: $videoMime）")
         }
 
-        // Pre-flight: AV1 hardware encoder must exist on this device.
-        val av1EncoderName = findHardwareAv1EncoderName()
-        if (av1EncoderName == null) {
+        // Pre-flight: hardware HEVC encoder. Pretty much guaranteed on any modern
+        // phone; if absent we fail fast.
+        val hevcEncoderName = findHardwareEncoderName(MediaFormat.MIMETYPE_VIDEO_HEVC)
+        if (hevcEncoderName == null) {
             extractor.release()
-            val all = listAv1Encoders().joinToString(", ").ifEmpty { "（一个 AV1 编码器都没找到）" }
-            return Result.Failed("本机无硬件 AV1 编码器。系统中找到的 AV1 编码器: $all")
+            val all = listEncoders(MediaFormat.MIMETYPE_VIDEO_HEVC).joinToString(", ")
+                .ifEmpty { "（无 HEVC 编码器）" }
+            return Result.Failed("本机无硬件 HEVC 编码器。系统中: $all")
         }
-        com.wjbyt.j2h.work.ConversionForegroundService.appendLog("  · 使用 AV1 编码器: $av1EncoderName")
+        com.wjbyt.j2h.work.ConversionForegroundService.appendLog("  · 使用 HEVC 编码器: $hevcEncoderName")
 
         val w = videoFormat.getInteger(MediaFormat.KEY_WIDTH)
         val h = videoFormat.getInteger(MediaFormat.KEY_HEIGHT)
@@ -115,10 +116,10 @@ object VideoTranscoder {
         val isHdr = isDolbyVisionInput || isHdrFormat(videoFormat)
 
         // Build encoder format.
-        val encoderFormat = MediaFormat.createVideoFormat("video/av01", w, h).apply {
+        val encoderFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, w, h).apply {
             setInteger(MediaFormat.KEY_PROFILE,
-                if (isHdr) MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10
-                else       MediaCodecInfo.CodecProfileLevel.AV1ProfileMain8)
+                if (isHdr) MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                else       MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
@@ -167,11 +168,11 @@ object VideoTranscoder {
         var muxer: MediaMuxer? = null
         var inputSurface: android.view.Surface? = null
         try {
-            encoder = MediaCodec.createByCodecName(av1EncoderName)
+            encoder = MediaCodec.createByCodecName(hevcEncoderName)
             try {
                 encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             } catch (e: Exception) {
-                return Result.Failed("AV1 编码器配置失败: ${e.message}", keepOriginal = true)
+                return Result.Failed("HEVC 编码器配置失败: ${e.message}", keepOriginal = true)
             }
             inputSurface = encoder.createInputSurface()
 
@@ -314,8 +315,9 @@ object VideoTranscoder {
                 return Result.Failed("已转码但删除原视频失败", keepOriginal = true)
             }
             val saved = if (srcSize > 0) (100 - outSize * 100 / srcSize) else 0L
+            val dvNote = if (isDolbyVisionInput) "（DV→HDR10+）" else ""
             return Result.Ok(targetName, srcSize, outSize,
-                "AV1 ${if (isHdr) "Main10 HDR" else "Main8 SDR"}, 减小 ${saved}%")
+                "HEVC ${if (isHdr) "Main10 HDR10+" else "Main SDR"}$dvNote, 减小 ${saved}%")
         } catch (t: Throwable) {
             outFile.delete()
             return Result.Failed("[${t.javaClass.simpleName}] ${t.message ?: "(no message)"}",
@@ -341,15 +343,13 @@ object VideoTranscoder {
         return false
     }
 
-    /** Returns the name of a hardware-accelerated AV1 encoder, or null if none. */
-    private fun findHardwareAv1EncoderName(): String? {
+    private fun findHardwareEncoderName(mime: String): String? {
         val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
         for (info in list.codecInfos) {
             if (!info.isEncoder) continue
             if (info.isAlias) continue
-            val supportsAv1 = info.supportedTypes.any { it.equals("video/av01", ignoreCase = true) }
-            if (!supportsAv1) continue
-            // Use the official API instead of name guessing.
+            val supports = info.supportedTypes.any { it.equals(mime, ignoreCase = true) }
+            if (!supports) continue
             val isHw = try { info.isHardwareAccelerated } catch (_: Throwable) { false }
             val isSw = try { info.isSoftwareOnly } catch (_: Throwable) { false }
             if (isHw && !isSw) return info.name
@@ -357,14 +357,13 @@ object VideoTranscoder {
         return null
     }
 
-    /** Diagnostic listing of every AV1 encoder + its hw/sw classification. */
-    private fun listAv1Encoders(): List<String> {
+    private fun listEncoders(mime: String): List<String> {
         val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
         val out = mutableListOf<String>()
         for (info in list.codecInfos) {
             if (!info.isEncoder) continue
-            val supportsAv1 = info.supportedTypes.any { it.equals("video/av01", ignoreCase = true) }
-            if (!supportsAv1) continue
+            val supports = info.supportedTypes.any { it.equals(mime, ignoreCase = true) }
+            if (!supports) continue
             val hw = try { info.isHardwareAccelerated } catch (_: Throwable) { false }
             val sw = try { info.isSoftwareOnly } catch (_: Throwable) { false }
             out += "${info.name}(hw=$hw,sw=$sw)"
