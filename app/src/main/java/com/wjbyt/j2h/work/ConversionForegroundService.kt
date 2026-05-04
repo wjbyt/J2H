@@ -183,7 +183,11 @@ class ConversionForegroundService : Service() {
         appendLog("共发现 ${files.size} 张 JPG，开始转换…")
 
         val quality = store.qualitySnapshot()
-        appendLog("HEIC 质量 = $quality（硬件编码 / HeifWriter）")
+        appendLog("HEIC 质量 = $quality")
+        appendLog("编码：JPG → 8bit (HeifWriter) · DNG → 10bit (MediaCodec Main10)")
+        if (!com.wjbyt.j2h.heif.TenBitEncoder.isAvailable()) {
+            appendLog("⚠ 10-bit native lib 不可用，DNG 会失败")
+        }
         val converter = HeicConverter(applicationContext, quality = quality)
         var done = 0; var failed = 0; var skipped = 0
         for ((idx, f) in files.withIndex()) {

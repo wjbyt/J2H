@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">HEIC 转换器</string>
-    <string name="add_folder">添加文件夹</string>
+    <string name="add_folder">添加目录（可多次添加）</string>
     <string name="start">开始转换</string>
     <string name="stop">停止</string>
     <string name="folders_title">已选目录</string>

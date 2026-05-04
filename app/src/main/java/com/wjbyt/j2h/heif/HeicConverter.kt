@@ -3,6 +3,7 @@ package com.wjbyt.j2h.heif
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import androidx.documentfile.provider.DocumentFile
 import androidx.heifwriter.HeifWriter
 import java.io.File
@@ -37,6 +38,7 @@ class HeicConverter(
         val name = jpg.name ?: return Result.Failed("no name")
         val baseName = name.substringBeforeLast('.', name)
         val targetName = "$baseName.heic"
+        val isDng = name.lowercase().endsWith(".dng")
 
         val existing = parent.findFile(targetName)
         if (existing != null && existing.length() > 0) return Result.Skipped("$targetName 已存在")
@@ -50,17 +52,33 @@ class HeicConverter(
             "Make=${snapshot.make ?: "null"}, Model=${snapshot.model ?: "null"}"
         )
 
-        val jpgBytes = try {
+        val srcBytes = try {
             context.contentResolver.openInputStream(jpg.uri)?.use { it.readBytes() }
-                ?: return Result.Failed("无法打开 JPG")
+                ?: return Result.Failed("无法打开源文件")
         } catch (e: Exception) { return Result.Failed("读取失败: ${e.message}") }
 
-        val exifTiff = try {
-            com.wjbyt.j2h.exif.JpegExifExtractor.extractTiff(java.io.ByteArrayInputStream(jpgBytes))
-        } catch (_: Exception) { null }
+        // For JPG we extract the full TIFF EXIF blob to embed in HEIC. DNG already
+        // is TIFF-based but its primary IFD points at the raw image strips, not what
+        // we want to embed; for now we rely on MediaStoreSync (DateTime + mtime) for
+        // DNG → HEIC metadata visibility.
+        val exifTiff: ByteArray? = if (!isDng) {
+            try {
+                com.wjbyt.j2h.exif.JpegExifExtractor.extractTiff(java.io.ByteArrayInputStream(srcBytes))
+            } catch (_: Exception) { null }
+        } else null
 
+        return if (isDng) convertDng(jpg, parent, targetName, srcBytes, snapshot, existing)
+               else convertJpg(jpg, parent, targetName, srcBytes, exifTiff, snapshot, existing)
+    }
+
+    /** JPG → 8-bit HEIC via HeifWriter (hardware HEVC Main, fast). */
+    private fun convertJpg(
+        jpg: DocumentFile, parent: DocumentFile, targetName: String,
+        srcBytes: ByteArray, exifTiff: ByteArray?, snapshot: MediaStoreSync.Snapshot,
+        existing: DocumentFile?
+    ): Result {
         val bitmap = try {
-            BitmapFactory.decodeByteArray(jpgBytes, 0, jpgBytes.size, BitmapFactory.Options().apply {
+            BitmapFactory.decodeByteArray(srcBytes, 0, srcBytes.size, BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
                 inSampleSize = 1
             })
@@ -69,11 +87,6 @@ class HeicConverter(
 
         try {
             existing?.delete()
-
-            // Encode via Android's HeifWriter (hardware HEVC, fast). Then post-process to
-            // inject EXIF into the HEIC container so desktop tools (macOS Preview etc.)
-            // see camera/GPS info — vendor galleries on Android still won't show non-
-            // DateTime fields for HEIC, but the data is preserved in the file.
             val hwBytes = try { encodeViaHeifWriter(bitmap) }
                 catch (e: Exception) { return Result.Failed("HeifWriter 编码失败: ${e.message}") }
             val finalBytes = if (exifTiff != null && exifTiff.isNotEmpty()) {
@@ -84,13 +97,69 @@ class HeicConverter(
                     hwBytes
                 }
             } else hwBytes
-
-            return writeAndVerify("HeifWriter", finalBytes, parent, targetName, jpg, snapshot)
+            return writeAndVerify("HeifWriter-8bit", finalBytes, parent, targetName, jpg, snapshot)
                 ?: Result.Failed("HEIC 解码失败（图片可能超出本机 HEVC 解码能力）",
                                  keepOriginal = true)
-        } finally {
-            bitmap.recycle()
+        } finally { bitmap.recycle() }
+    }
+
+    /** DNG → 10-bit HEIC via MediaCodec HEVC Main10 + MediaMuxer HEIF. */
+    private fun convertDng(
+        jpg: DocumentFile, parent: DocumentFile, targetName: String,
+        srcBytes: ByteArray, snapshot: MediaStoreSync.Snapshot, existing: DocumentFile?
+    ): Result {
+        if (!TenBitEncoder.isAvailable()) {
+            return Result.Failed("10-bit 编码器不可用（native lib 未加载）", keepOriginal = true)
         }
+        val source = ImageDecoder.createSource(java.nio.ByteBuffer.wrap(srcBytes))
+        val bitmap = try {
+            ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                decoder.isMutableRequired = false
+                // EXTENDED_SRGB triggers RGBA_F16 output, preserving DNG's > 8-bit depth.
+                decoder.setTargetColorSpace(android.graphics.ColorSpace.get(
+                    android.graphics.ColorSpace.Named.EXTENDED_SRGB))
+            }
+        } catch (e: Exception) { return Result.Failed("DNG 解码失败: ${e.message}") }
+
+        if (bitmap.config != Bitmap.Config.RGBA_F16) {
+            // Some devices may downgrade. Convert to RGBA_F16 explicitly.
+            val converted = try {
+                bitmap.copy(Bitmap.Config.RGBA_F16, false)
+            } catch (e: Exception) { null }
+            bitmap.recycle()
+            if (converted == null) return Result.Failed("解码后无法获得 RGBA_F16 位图")
+            return finishDng(converted, jpg, parent, targetName, snapshot, existing)
+        }
+        return finishDng(bitmap, jpg, parent, targetName, snapshot, existing)
+    }
+
+    private fun finishDng(
+        bitmap: Bitmap, jpg: DocumentFile, parent: DocumentFile, targetName: String,
+        snapshot: MediaStoreSync.Snapshot, existing: DocumentFile?
+    ): Result {
+        try {
+            // Crop to even dimensions if needed (Main10 4:2:0 needs both axes even).
+            val w = bitmap.width and 1.inv()
+            val h = bitmap.height and 1.inv()
+            val even = if (w == bitmap.width && h == bitmap.height) bitmap
+                       else Bitmap.createBitmap(bitmap, 0, 0, w, h)
+            try {
+                existing?.delete()
+                val tmp = File.createTempFile("j2h_10b_", ".heic", context.cacheDir)
+                try {
+                    val err = TenBitEncoder.encode(even, tmp.absolutePath, qualityHint = quality)
+                    if (err != null) return Result.Failed("10-bit 编码失败: $err",
+                                                          keepOriginal = true)
+                    return writeAndVerify(
+                        "MediaCodec-Main10", tmp.readBytes(),
+                        parent, targetName, jpg, snapshot
+                    ) ?: Result.Failed("10-bit HEIC 解码失败", keepOriginal = true)
+                } finally { tmp.delete() }
+            } finally {
+                if (even !== bitmap) even.recycle()
+            }
+        } finally { bitmap.recycle() }
     }
 
     /**

@@ -23,7 +23,7 @@ object JpgScanner {
                 walk(child, out)
             } else if (child.isFile) {
                 val name = child.name?.lowercase() ?: continue
-                if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
+                if (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".dng")) {
                     out += Found(child, dir)
                 }
             }
