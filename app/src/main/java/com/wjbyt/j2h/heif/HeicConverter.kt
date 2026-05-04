@@ -148,7 +148,6 @@ class HeicConverter(
         snapshot: MediaStoreSync.Snapshot, existing: DocumentFile?
     ): Result {
         try {
-            // Crop to even dimensions if needed (Main10 4:2:0 needs both axes even).
             val w = bitmap.width and 1.inv()
             val h = bitmap.height and 1.inv()
             val even = if (w == bitmap.width && h == bitmap.height) bitmap
@@ -160,10 +159,38 @@ class HeicConverter(
                     val err = TenBitEncoder.encode(even, tmp.absolutePath, qualityHint = quality)
                     if (err != null) return Result.Failed("10-bit 编码失败: $err",
                                                           keepOriginal = true)
-                    return writeAndVerify(
-                        "MediaCodec-Main10", tmp.readBytes(),
-                        parent, targetName, jpg, snapshot
-                    ) ?: Result.Failed("10-bit HEIC 解码失败", keepOriginal = true)
+
+                    // Diagnostics: file size + first 32 bytes (so we can see if it's a
+                    // valid HEIF starting with 'ftyp' or something else entirely).
+                    val bytes = tmp.readBytes()
+                    val head = bytes.take(32).joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+                    val ascii = bytes.take(32).joinToString("") {
+                        val c = it.toInt() and 0xFF
+                        if (c in 0x20..0x7E) c.toChar().toString() else "."
+                    }
+                    com.wjbyt.j2h.work.ConversionForegroundService
+                        .appendLog("  · 10bit 输出 ${bytes.size}B, 头部: $head ($ascii)")
+
+                    val ok = writeAndVerify(
+                        "MediaCodec-Main10", bytes, parent, targetName, jpg, snapshot
+                    )
+                    if (ok != null) return ok
+
+                    // Verify failed: keep the suspect output as .untrusted.heic so the user
+                    // can pull it off the device and run mediainfo / a HEIF parser on it.
+                    val baseName = targetName.removeSuffix(".heic")
+                    val untrusted = parent.findFile("$baseName.10bit.untrusted.heic")
+                    untrusted?.delete()
+                    val keep = parent.createFile("image/heic", "$baseName.10bit.untrusted.heic")
+                    if (keep != null) {
+                        try {
+                            context.contentResolver.openOutputStream(keep.uri, "w")
+                                ?.use { it.write(bytes) }
+                            com.wjbyt.j2h.work.ConversionForegroundService
+                                .appendLog("    → 失败的 10-bit HEIC 已保留为 $baseName.10bit.untrusted.heic")
+                        } catch (_: Exception) {}
+                    }
+                    return Result.Failed("10-bit HEIC 解码失败", keepOriginal = true)
                 } finally { tmp.delete() }
             } finally {
                 if (even !== bitmap) even.recycle()

@@ -61,18 +61,23 @@ object TenBitEncoder {
                 MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel62)
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUVP010)
-            // Bitrate target — generous so quality 95-equivalent.
             val pixels = w.toLong() * h
-            val bitrate = (pixels * 8L).coerceAtMost(200_000_000L) // cap at 200 Mbps
+            val bitrate = (pixels * 8L).coerceAtMost(200_000_000L)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate.toInt())
-            setInteger(MediaFormat.KEY_FRAME_RATE, 30) // dummy for still
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0) // every frame keyframe
+            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0)
             setInteger(MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            // 10-bit color metadata
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
             setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+            // HEIF muxer hints — without these, MediaMuxer may write a video-style
+            // file instead of a still-image HEIF. AOSP's HeifWriter sets all of these.
+            setInteger("frame-count", 1)
+            setInteger("tile-width", w)
+            setInteger("tile-height", h)
+            setInteger("grid-rows", 1)
+            setInteger("grid-cols", 1)
         }
 
         val codec = try { MediaCodec.createEncoderByType(codecMime) }
