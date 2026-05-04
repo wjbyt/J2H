@@ -4,19 +4,18 @@ import android.graphics.Bitmap
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
-import android.media.MediaMuxer
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
 /**
- * Encodes a Bitmap (must be RGBA_F16) into a 10-bit HEIC at [outputPath]
- * using HEVC Main10 via MediaCodec (hardware) and MediaMuxer's HEIF muxer.
+ * Encodes a Bitmap (RGBA_F16) into a 10-bit HEIC at [outputPath] using
+ * MediaCodec for HEVC Main10 (hardware) and a hand-rolled HEIF container
+ * writer.
  *
- * Why this path instead of HeifWriter:
- *   - HeifWriter is hardcoded to HEVC Main profile (8-bit). For DNGs decoded
- *     to 16-bit half-float, we'd be throwing away the extra bit depth.
- *   - This path explicitly requests HEVCProfileMain10 + COLOR_FormatYUVP010
- *     and lets MediaMuxer.MUXER_OUTPUT_HEIF wrap the bitstream into a HEIF
- *     container — no hand-rolled box construction.
+ * Why hand-roll the container: Android's MediaMuxer.MUXER_OUTPUT_HEIF only
+ * supports HEVC Main profile (8-bit). When given Main10 it silently falls
+ * back to writing an MP4 video. So we capture the raw HEVC bitstream from
+ * MediaCodec and wrap it ourselves per ISO/IEC 23008-12.
  */
 object TenBitEncoder {
 
@@ -52,7 +51,6 @@ object TenBitEncoder {
             return "dimensions must be positive and even (got ${w}x${h})"
         }
 
-        // Configure HEVC Main10 encoder.
         val codecMime = MediaFormat.MIMETYPE_VIDEO_HEVC
         val format = MediaFormat.createVideoFormat(codecMime, w, h).apply {
             setInteger(MediaFormat.KEY_PROFILE,
@@ -71,13 +69,6 @@ object TenBitEncoder {
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
             setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-            // HEIF muxer hints — without these, MediaMuxer may write a video-style
-            // file instead of a still-image HEIF. AOSP's HeifWriter sets all of these.
-            setInteger("frame-count", 1)
-            setInteger("tile-width", w)
-            setInteger("tile-height", h)
-            setInteger("grid-rows", 1)
-            setInteger("grid-cols", 1)
         }
 
         val codec = try { MediaCodec.createEncoderByType(codecMime) }
@@ -91,62 +82,97 @@ object TenBitEncoder {
             }
             codec.start()
 
-            // Feed input as a P010 buffer.
+            val payloadAccum = ByteArrayOutputStream() // raw Annex-B image NAL units
+            var csdBytes: ByteArray? = null
+
+            feedInputP010(codec, bitmap, w, h)?.let { return it }
+
             val info = MediaCodec.BufferInfo()
-            val muxer = try { MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_HEIF) }
-                catch (e: Exception) { return "MediaMuxer create: ${e.message}" }
-            var trackIndex = -1
-            var muxerStarted = false
-
-            try {
-                feedInputP010(codec, bitmap, w, h)?.let { return it }
-
-                // Drain output.
-                val timeoutUs = 5_000_000L
-                val deadline = System.nanoTime() + timeoutUs * 1_000L * 12 // up to ~minute
-                while (true) {
-                    if (System.nanoTime() > deadline) return "encode timeout"
-                    val outIdx = codec.dequeueOutputBuffer(info, timeoutUs)
-                    when {
-                        outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            if (muxerStarted) return "encoder produced format twice"
-                            trackIndex = muxer.addTrack(codec.outputFormat)
-                            muxer.start()
-                            muxerStarted = true
-                        }
-                        outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> continue
-                        outIdx >= 0 -> {
-                            val outBuf = codec.getOutputBuffer(outIdx)
-                            if (outBuf != null && info.size > 0 && muxerStarted &&
-                                (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                                outBuf.position(info.offset)
-                                outBuf.limit(info.offset + info.size)
-                                muxer.writeSampleData(trackIndex, outBuf, info)
-                            }
-                            codec.releaseOutputBuffer(outIdx, false)
-                            if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+            val timeoutUs = 5_000_000L
+            val deadlineNanos = System.nanoTime() + 60_000_000_000L
+            while (true) {
+                if (System.nanoTime() > deadlineNanos) return "encode timeout"
+                val outIdx = codec.dequeueOutputBuffer(info, timeoutUs)
+                when {
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        val of = codec.outputFormat
+                        // csd-0 contains VPS+SPS+PPS as Annex-B.
+                        of.getByteBuffer("csd-0")?.let { bb ->
+                            val arr = ByteArray(bb.remaining())
+                            bb.get(arr)
+                            csdBytes = arr
                         }
                     }
+                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> continue
+                    outIdx >= 0 -> {
+                        val ob = codec.getOutputBuffer(outIdx)
+                        if (ob != null && info.size > 0) {
+                            ob.position(info.offset)
+                            ob.limit(info.offset + info.size)
+                            val arr = ByteArray(info.size)
+                            ob.get(arr)
+                            if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                                // Some encoders emit CSD here too; prefer this if we didn't get it
+                                // via outputFormat.
+                                if (csdBytes == null) csdBytes = arr
+                            } else {
+                                payloadAccum.write(arr)
+                            }
+                        }
+                        codec.releaseOutputBuffer(outIdx, false)
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                    }
                 }
-                return null // success
-            } finally {
-                if (muxerStarted) {
-                    try { muxer.stop() } catch (_: Exception) {}
-                }
-                try { muxer.release() } catch (_: Exception) {}
             }
+
+            val csd = csdBytes ?: return "encoder did not provide csd-0 (VPS/SPS/PPS)"
+            val payload = payloadAccum.toByteArray()
+            if (payload.isEmpty()) return "encoder produced no image data"
+
+            return assembleHeif(csd, payload, w, h, outputPath)
         } finally {
             try { codec.stop() } catch (_: Exception) {}
             try { codec.release() } catch (_: Exception) {}
         }
     }
 
-    /**
-     * Pack the bitmap into the codec's raw input buffer as P010 (Y plane then
-     * interleaved UV plane, each row tightly packed at width*2 bytes).
-     * Avoids the Image API since for some encoders the per-plane Buffer
-     * capacities don't match the natural row-stride writes (BufferOverflow).
-     */
+    private fun assembleHeif(
+        csdAnnexB: ByteArray, payloadAnnexB: ByteArray, w: Int, h: Int, outputPath: String
+    ): String? {
+        // Split CSD into VPS/SPS/PPS.
+        val csdNals = HevcParser.splitNalUnits(csdAnnexB)
+        val vps = csdNals.firstOrNull { it.type == HevcParser.NAL_VPS }
+            ?: return "no VPS in csd"
+        val sps = csdNals.firstOrNull { it.type == HevcParser.NAL_SPS }
+            ?: return "no SPS in csd"
+        val pps = csdNals.firstOrNull { it.type == HevcParser.NAL_PPS }
+            ?: return "no PPS in csd"
+
+        // hvcC body
+        val hvcC = HevcParser.buildHvcC(vps.data, sps.data, pps.data)
+
+        // Image NAL units (length-prefixed for HEIF mdat). Filter out any param sets
+        // that the encoder may have inlined into the payload.
+        val imageNals = HevcParser.splitNalUnits(payloadAnnexB)
+            .filter { it.type !in listOf(HevcParser.NAL_VPS, HevcParser.NAL_SPS, HevcParser.NAL_PPS) }
+        if (imageNals.isEmpty()) return "no image NAL units in encoded payload"
+        val mdatPayload = HevcParser.toLengthPrefixed(imageNals)
+
+        // Build container.
+        val container = HeifContainerWriter(
+            width = w, height = h,
+            hvcCBody = hvcC,
+            imageData = mdatPayload,
+            bitDepth = 10,
+            colourPrimaries = 1, transferCharacteristics = 1, matrixCoefficients = 1,
+            fullRange = false
+        ).build()
+
+        java.io.File(outputPath).writeBytes(container)
+        return null
+    }
+
+    /** Pack the bitmap into the codec's raw input buffer as P010 + EOS. */
     private fun feedInputP010(codec: MediaCodec, bitmap: Bitmap, w: Int, h: Int): String? {
         val inputIdx = codec.dequeueInputBuffer(10_000_000L)
         if (inputIdx < 0) return "no input buffer"
@@ -154,9 +180,8 @@ object TenBitEncoder {
             ?: return "null input buffer"
         inBuf.clear()
 
-        val yStride = w * 2          // 2 bytes per Y sample
-        val uvStride = w * 2         // 2 bytes per UV sample × 2 samples per pair = 4
-                                     // bytes per chroma pos × W/2 positions = 2W bytes/row
+        val yStride = w * 2
+        val uvStride = w * 2
         val ySize = yStride * h
         val uvSize = uvStride * (h / 2)
         val totalBytes = ySize + uvSize
@@ -177,12 +202,6 @@ object TenBitEncoder {
         return null
     }
 
-    /**
-     * Native side fills the [out] byte array with planar P010:
-     *   - Y plane occupies [0, yPlaneRowStride * height) via row-padded writes.
-     *   - UV plane (interleaved) occupies [uvPlaneOffsetInBuffer, ...) via
-     *     uvPlaneRowStride-wide rows.
-     */
     @JvmStatic private external fun nativeRgbaF16ToP010(
         bitmap: Bitmap, out: ByteArray,
         yPlaneRowStrideBytes: Int, uvPlaneRowStrideBytes: Int,
