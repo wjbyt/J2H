@@ -176,11 +176,17 @@ class ConversionForegroundService : Service() {
             files += JpgScanner.scan(applicationContext, u)
         }
         if (files.isEmpty()) {
-            appendLog("未发现 JPG 文件")
+            appendLog("未发现可转换的图片")
             return
         }
+        // Count by source type for a clearer scan summary.
+        val jpgCount = files.count {
+            val n = it.file.name?.lowercase() ?: ""
+            n.endsWith(".jpg") || n.endsWith(".jpeg")
+        }
+        val dngCount = files.count { (it.file.name?.lowercase() ?: "").endsWith(".dng") }
         _state.value = _state.value.copy(total = files.size)
-        appendLog("共发现 ${files.size} 张 JPG，开始转换…")
+        appendLog("共发现 ${files.size} 张图片（JPG: $jpgCount, DNG: $dngCount），开始转换…")
 
         val quality = store.qualitySnapshot()
         appendLog("HEIC 质量 = $quality")
@@ -193,21 +199,25 @@ class ConversionForegroundService : Service() {
         for ((idx, f) in files.withIndex()) {
             if (!currentCoroutineContext().isActive) break
             val name = f.file.name ?: "?"
-            _state.value = _state.value.copy(current = name)
+            val tag = when {
+                name.lowercase().endsWith(".dng") -> "[DNG→10bit]"
+                else -> "[JPG→8bit ]"
+            }
+            _state.value = _state.value.copy(current = "$tag $name")
             updateNotification("正在转换 ($idx/${files.size}): $name", idx, files.size)
             try {
                 when (val r = converter.convert(f.file, f.parent)) {
                     is HeicConverter.Result.Ok -> {
                         done++
-                        appendLog("✓ $name → ${r.outName} ${r.bytesIn / 1024}KB→${r.bytesOut / 1024}KB · ${r.encoder}")
+                        appendLog("✓ $tag $name → ${r.outName} ${r.bytesIn / 1024}KB→${r.bytesOut / 1024}KB · ${r.encoder}")
                     }
                     is HeicConverter.Result.Skipped -> {
                         skipped++
-                        appendLog("· $name 跳过：${r.reason}")
+                        appendLog("· $tag $name 跳过：${r.reason}")
                     }
                     is HeicConverter.Result.Failed -> {
                         failed++
-                        appendLog("✗ $name 失败：${r.reason}（已保留原文件）")
+                        appendLog("✗ $tag $name 失败：${r.reason}（已保留原文件）")
                     }
                 }
             } catch (e: Throwable) {

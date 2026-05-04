@@ -125,9 +125,12 @@ class HeicConverter(
             ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 decoder.isMutableRequired = false
-                // EXTENDED_SRGB triggers RGBA_F16 output, preserving DNG's > 8-bit depth.
+                // BT.2020 wide-gamut target — ImageDecoder maps DNG sensor RGB into
+                // BT.2020 primaries; we then encode YUV with the BT.2020 matrix and
+                // tag the colr/nclx box with primaries=9 / matrix=9 so consumers
+                // render with the wide gamut intent.
                 decoder.setTargetColorSpace(android.graphics.ColorSpace.get(
-                    android.graphics.ColorSpace.Named.EXTENDED_SRGB))
+                    android.graphics.ColorSpace.Named.BT2020))
             }
         } catch (e: Exception) { return Result.Failed("DNG 解码失败: ${e.message}") }
 
@@ -156,7 +159,14 @@ class HeicConverter(
                 existing?.delete()
                 val tmp = File.createTempFile("j2h_10b_", ".heic", context.cacheDir)
                 try {
-                    val err = TenBitEncoder.encode(even, tmp.absolutePath, qualityHint = quality)
+                    val err = TenBitEncoder.encode(
+                        even, tmp.absolutePath, qualityHint = quality,
+                        // BT.2020 NCL — primaries=9, transfer=1 (BT.709 SDR gamma is
+                        // visually closest to sRGB; BT.2020 transfer 14/15 is for
+                        // strict broadcast HDR which most viewers don't render
+                        // correctly), matrix=9, limited range.
+                        colourPrimaries = 9, transferCharacteristics = 1, matrixCoefficients = 9
+                    )
                     if (err != null) return Result.Failed("10-bit 编码失败: $err",
                                                           keepOriginal = true)
 

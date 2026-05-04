@@ -34,13 +34,19 @@ object TenBitEncoder {
     fun isAvailable(): Boolean = loaded
 
     /** Returns null on success, or an error string. */
-    fun encode(bitmap: Bitmap, outputPath: String, qualityHint: Int = 95): String? = try {
-        encodeImpl(bitmap, outputPath, qualityHint)
+    fun encode(
+        bitmap: Bitmap, outputPath: String, qualityHint: Int = 95,
+        colourPrimaries: Int = 9, transferCharacteristics: Int = 1, matrixCoefficients: Int = 9
+    ): String? = try {
+        encodeImpl(bitmap, outputPath, qualityHint, colourPrimaries, transferCharacteristics, matrixCoefficients)
     } catch (t: Throwable) {
         "[${t.javaClass.simpleName}] ${t.message ?: "(no message)"}"
     }
 
-    private fun encodeImpl(bitmap: Bitmap, outputPath: String, qualityHint: Int): String? {
+    private fun encodeImpl(
+        bitmap: Bitmap, outputPath: String, qualityHint: Int,
+        colourPrimaries: Int, transferCharacteristics: Int, matrixCoefficients: Int
+    ): String? {
         if (!loaded) return "10bit native lib not loaded: $loadError"
         if (bitmap.config != Bitmap.Config.RGBA_F16) {
             return "bitmap must be RGBA_F16 (got ${bitmap.config})"
@@ -67,7 +73,9 @@ object TenBitEncoder {
             setInteger(MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+            // Tell the encoder the input pixels are in BT.2020 primaries with SDR
+            // transfer; matches the colr/nclx box we emit.
+            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         }
 
@@ -129,7 +137,8 @@ object TenBitEncoder {
             val payload = payloadAccum.toByteArray()
             if (payload.isEmpty()) return "encoder produced no image data"
 
-            return assembleHeif(csd, payload, w, h, outputPath)
+            return assembleHeif(csd, payload, w, h, outputPath,
+                colourPrimaries, transferCharacteristics, matrixCoefficients)
         } finally {
             try { codec.stop() } catch (_: Exception) {}
             try { codec.release() } catch (_: Exception) {}
@@ -137,7 +146,8 @@ object TenBitEncoder {
     }
 
     private fun assembleHeif(
-        csdAnnexB: ByteArray, payloadAnnexB: ByteArray, w: Int, h: Int, outputPath: String
+        csdAnnexB: ByteArray, payloadAnnexB: ByteArray, w: Int, h: Int, outputPath: String,
+        colourPrimaries: Int, transferCharacteristics: Int, matrixCoefficients: Int
     ): String? {
         // Split CSD into VPS/SPS/PPS.
         val csdNals = HevcParser.splitNalUnits(csdAnnexB)
@@ -164,7 +174,9 @@ object TenBitEncoder {
             hvcCBody = hvcC,
             imageData = mdatPayload,
             bitDepth = 10,
-            colourPrimaries = 1, transferCharacteristics = 1, matrixCoefficients = 1,
+            colourPrimaries = colourPrimaries,
+            transferCharacteristics = transferCharacteristics,
+            matrixCoefficients = matrixCoefficients,
             fullRange = false
         ).build()
 

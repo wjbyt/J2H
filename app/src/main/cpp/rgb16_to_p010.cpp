@@ -6,8 +6,10 @@
 //   - UV plane: (W/2)*(H/2) chroma positions, each 2 bytes U then 2 bytes V,
 //               interleaved (NV12-like), 10-bit value in upper bits.
 //
-// Color conversion uses BT.709 limited range, which is what most HEVC consumers
-// (including Android's video pipeline and macOS Preview) expect for HEIF.
+// Color conversion uses BT.2020 non-constant-luminance (NCL) limited range —
+// matches the colr/nclx box (primaries=9, matrix=9) we emit. ImageDecoder
+// upstream is asked to deliver pixels already in BT.2020 primaries, so the
+// YUV math here is straight BT.2020 luma weights.
 
 #include <jni.h>
 #include <android/bitmap.h>
@@ -110,10 +112,10 @@ Java_com_wjbyt_j2h_heif_TenBitEncoder_nativeRgbaF16ToP010(
                     if (G < 0.f) G = 0.f; else if (G > 1.f) G = 1.f;
                     if (B < 0.f) B = 0.f; else if (B > 1.f) B = 1.f;
 
-                    // BT.709 luma; chroma in -0.5..+0.5 around 0.
-                    float Y  = 0.2126f * R + 0.7152f * G + 0.0722f * B;
-                    float Cb = (B - Y) / 1.8556f;
-                    float Cr = (R - Y) / 1.5748f;
+                    // BT.2020 NCL luma; chroma in -0.5..+0.5 around 0.
+                    float Y  = 0.2627f * R + 0.6780f * G + 0.0593f * B;
+                    float Cb = (B - Y) / 1.8814f;
+                    float Cr = (R - Y) / 1.4746f;
 
                     // Limited range 10-bit: Y 64..940, C 64..960.
                     int Y10 = (int)std::lround(Y * 876.0f + 64.0f);
