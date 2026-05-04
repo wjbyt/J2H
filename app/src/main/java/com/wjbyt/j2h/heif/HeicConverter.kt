@@ -153,6 +153,10 @@ class HeicConverter(
         try {
             val w = bitmap.width and 1.inv()
             val h = bitmap.height and 1.inv()
+            val pixels = w.toLong() * h
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · 解码后尺寸 ${w}x${h} ≈ ${pixels / 1_000_000} MP"
+            )
             val even = if (w == bitmap.width && h == bitmap.height) bitmap
                        else Bitmap.createBitmap(bitmap, 0, 0, w, h)
             try {

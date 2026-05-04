@@ -39,6 +39,8 @@ object TenBitEncoder {
         colourPrimaries: Int = 9, transferCharacteristics: Int = 1, matrixCoefficients: Int = 9
     ): String? = try {
         encodeImpl(bitmap, outputPath, qualityHint, colourPrimaries, transferCharacteristics, matrixCoefficients)
+    } catch (e: MediaCodec.CodecException) {
+        "[CodecException] err=${e.errorCode} diag=${e.diagnosticInfo} msg=${e.message ?: "?"}"
     } catch (t: Throwable) {
         "[${t.javaClass.simpleName}] ${t.message ?: "(no message)"}"
     }
@@ -81,8 +83,21 @@ object TenBitEncoder {
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         }
 
+        // Check encoder capabilities up front: HEVC Main10 Level 6.2 maxes out around
+        // 35 M luma samples per picture (8K-ish). Above that, single-frame hardware
+        // encoding will fail with an opaque CodecException.
         val codec = try { MediaCodec.createEncoderByType(codecMime) }
             catch (e: Exception) { return "createEncoderByType: ${e.message}" }
+        try {
+            val caps = codec.codecInfo.getCapabilitiesForType(codecMime)
+            val v = caps.videoCapabilities
+            if (!v.isSizeSupported(w, h)) {
+                val maxW = v.supportedWidths.upper
+                val maxH = v.supportedHeights.upper
+                codec.release()
+                return "硬件 HEVC Main10 编码器不支持 ${w}x${h} 单帧（最大约 ${maxW}x${maxH}）"
+            }
+        } catch (_: Exception) { /* fall through to configure attempt */ }
 
         try {
             try {
