@@ -61,22 +61,25 @@ class HeicConverter(
             ?: return Result.Failed("解码失败")
 
         try {
-            // Encoder chain: libheif first (better compression, full EXIF in file), fall
-            // back to HeifWriter (auto-tiles via hardware HEVC, decodable for any size).
             existing?.delete()
-            if (LibheifEncoder.isAvailable()) {
-                val bytes = runCatching { encodeViaLibheif(bitmap, exifTiff) }
-                    .onFailure { com.wjbyt.j2h.work.ConversionForegroundService
-                        .appendLog("  · libheif 编码异常: ${it.message}") }
-                    .getOrNull()
-                if (bytes != null) {
-                    writeAndVerify("libheif", bytes, parent, targetName, jpg, snapshot)?.let { return it }
-                }
-            }
+
+            // Encode via Android's HeifWriter (hardware HEVC, fast). Then post-process to
+            // inject EXIF into the HEIC container so desktop tools (macOS Preview etc.)
+            // see camera/GPS info — vendor galleries on Android still won't show non-
+            // DateTime fields for HEIC, but the data is preserved in the file.
             val hwBytes = try { encodeViaHeifWriter(bitmap) }
                 catch (e: Exception) { return Result.Failed("HeifWriter 编码失败: ${e.message}") }
-            return writeAndVerify("HeifWriter", hwBytes, parent, targetName, jpg, snapshot)
-                ?: Result.Failed("所有编码路径都无法在本机解码（图片可能超出 HEVC 能力）",
+            val finalBytes = if (exifTiff != null && exifTiff.isNotEmpty()) {
+                try { HeifExifInjector.inject(hwBytes, exifTiff) }
+                catch (e: Exception) {
+                    com.wjbyt.j2h.work.ConversionForegroundService
+                        .appendLog("  · EXIF 注入异常（保留无 EXIF 输出）: ${e.message}")
+                    hwBytes
+                }
+            } else hwBytes
+
+            return writeAndVerify("HeifWriter", finalBytes, parent, targetName, jpg, snapshot)
+                ?: Result.Failed("HEIC 解码失败（图片可能超出本机 HEVC 解码能力）",
                                  keepOriginal = true)
         } finally {
             bitmap.recycle()
@@ -121,15 +124,6 @@ class HeicConverter(
                 .appendLog("  · 已转换但删除原 JPG 失败 — 手动删除")
         }
         return Result.Ok(targetName, srcSize, outSize, "$label$metaNote")
-    }
-
-    private fun encodeViaLibheif(bitmap: Bitmap, exifTiff: ByteArray?): ByteArray {
-        val tmp = File.createTempFile("j2h_lh_", ".heic", context.cacheDir)
-        try {
-            val err = LibheifEncoder.encode(bitmap, exifTiff, tmp.absolutePath, quality)
-            if (err != null) throw RuntimeException("libheif: $err")
-            return tmp.readBytes()
-        } finally { tmp.delete() }
     }
 
     private fun encodeViaHeifWriter(bitmap: Bitmap): ByteArray {
