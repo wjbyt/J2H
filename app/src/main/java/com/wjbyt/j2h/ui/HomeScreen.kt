@@ -4,15 +4,12 @@ import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -23,7 +20,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -71,16 +68,25 @@ fun HomeScreen(
     Scaffold(
         topBar = { TopAppBar(title = { Text(stringFrom(R.string.app_name)) }) },
         floatingActionButton = {
+            // Plain icon-only FAB so it covers less of the log area below.
             if (!state.running) {
-                ExtendedFloatingActionButton(
-                    onClick = { onPickFolder { uri -> scope.launch { store.add(uri) } } },
-                    icon = { Icon(Icons.Filled.Add, contentDescription = null) },
-                    text = { Text(stringFrom(R.string.add_folder)) }
-                )
+                FloatingActionButton(
+                    onClick = { onPickFolder { uri -> scope.launch { store.add(uri) } } }
+                ) {
+                    Icon(Icons.Filled.Add, contentDescription = stringFrom(R.string.add_folder))
+                }
             }
         }
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
+        // Whole page scrolls vertically — previously the log was clipped on
+        // shorter screens because the cards above pushed it off the viewport.
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
 
             // ----- progress block -----
             Card(modifier = Modifier.fillMaxWidth()) {
@@ -179,10 +185,13 @@ fun HomeScreen(
             if (uris.isEmpty()) {
                 Text(stringFrom(R.string.empty_folders), style = MaterialTheme.typography.bodySmall)
             } else {
+                // A plain Column instead of LazyColumn — nesting LazyColumn
+                // inside a vertically-scrolling parent throws at runtime.
+                // The folder list is short (handful of entries) so a non-lazy
+                // implementation is fine here.
                 Card(modifier = Modifier.fillMaxWidth()) {
-                    LazyColumn(modifier = Modifier.fillMaxWidth(),
-                        contentPadding = PaddingValues(8.dp)) {
-                        items(uris, key = { it.toString() }) { uri ->
+                    Column(Modifier.padding(8.dp).fillMaxWidth()) {
+                        for (uri in uris) {
                             Row(verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                                 Text(
@@ -220,7 +229,10 @@ fun HomeScreen(
                 }
             }
             Spacer(Modifier.height(4.dp))
-            Card(modifier = Modifier.fillMaxWidth().weight(1f)) {
+            // Fixed height so the outer page scroll keeps working — weight(1f)
+            // is illegal inside a verticalScroll Column. Inner scroll keeps the
+            // log itself navigable for long histories.
+            Card(modifier = Modifier.fillMaxWidth().height(360.dp)) {
                 SelectionContainer {
                     Box(Modifier.padding(8.dp)) {
                         Column(modifier = Modifier.fillMaxSize()
@@ -233,6 +245,8 @@ fun HomeScreen(
                     }
                 }
             }
+
+            Spacer(Modifier.height(16.dp))
         }
     }
 }

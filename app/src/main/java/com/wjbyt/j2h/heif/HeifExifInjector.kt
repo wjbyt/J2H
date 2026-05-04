@@ -125,8 +125,14 @@ object HeifExifInjector {
 
         // ----- Build new sub-box bytes (sizes are deterministic) -----
         val newIinfEntries = parsedIinf.entries.toMutableList()
-        newIinfEntries += IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "", flags = 1)
+        // The Exif metadata item is NOT hidden per HEIF spec — the `hidden`
+        // bit (flags & 1) only applies to image items that shouldn't be
+        // presented (grid tiles etc.). Some galleries (vivo) skip lookup of
+        // metadata items that are marked hidden, which is the most plausible
+        // remaining gap between our output and Samsung's accepted HEICs.
+        newIinfEntries += IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "", flags = 0)
         if (thumb != null) {
+            // Thumbnail image item — hide it from primary presentation.
             newIinfEntries += IinfEntry(itemId = thumbItemId, itemType = "hvc1", itemName = "", flags = 1)
         }
         val newIinfBytes = buildIinf(parsedIinf.version, newIinfEntries)
