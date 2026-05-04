@@ -179,18 +179,22 @@ class ConversionForegroundService : Service() {
             appendLog("未发现可转换的图片")
             return
         }
-        // Count by source type for a clearer scan summary.
         val jpgCount = files.count {
             val n = it.file.name?.lowercase() ?: ""
             n.endsWith(".jpg") || n.endsWith(".jpeg")
         }
         val dngCount = files.count { (it.file.name?.lowercase() ?: "").endsWith(".dng") }
+        val videoCount = files.count {
+            val n = it.file.name?.lowercase() ?: ""
+            (n.endsWith(".mp4") || n.endsWith(".mov")) && !n.endsWith(".av1.mp4")
+        }
         _state.value = _state.value.copy(total = files.size)
-        appendLog("共发现 ${files.size} 张图片（JPG: $jpgCount, DNG: $dngCount），开始转换…")
+        appendLog("共发现 ${files.size} 个文件（JPG: $jpgCount, DNG: $dngCount, 视频: $videoCount），开始转换…")
 
         val quality = store.qualitySnapshot()
-        appendLog("HEIC 质量 = $quality")
-        appendLog("编码：JPG → 8bit (HeifWriter) · DNG → 10bit (MediaCodec Main10)")
+        val videoPct = store.videoBitratePctSnapshot()
+        appendLog("HEIC 质量 = $quality · 视频码率 = ${videoPct}%（相对源 HEVC）")
+        appendLog("编码：JPG → 8bit (HeifWriter) · DNG → 10bit (MediaCodec Main10) · 视频 → AV1")
         if (!com.wjbyt.j2h.heif.TenBitEncoder.isAvailable()) {
             appendLog("⚠ 10-bit native lib 不可用，DNG 会失败")
         }
@@ -199,14 +203,35 @@ class ConversionForegroundService : Service() {
         for ((idx, f) in files.withIndex()) {
             if (!currentCoroutineContext().isActive) break
             val name = f.file.name ?: "?"
+            val lower = name.lowercase()
+            val isVideo = (lower.endsWith(".mp4") || lower.endsWith(".mov")) && !lower.endsWith(".av1.mp4")
             val tag = when {
-                name.lowercase().endsWith(".dng") -> "[DNG→10bit]"
+                isVideo -> "[VID→AV1  ]"
+                lower.endsWith(".dng") -> "[DNG→10bit]"
                 else -> "[JPG→8bit ]"
             }
             _state.value = _state.value.copy(current = "$tag $name")
             updateNotification("正在转换 ($idx/${files.size}): $name", idx, files.size)
             try {
-                when (val r = converter.convert(f.file, f.parent)) {
+                if (isVideo) {
+                    when (val r = com.wjbyt.j2h.video.VideoTranscoder.transcode(
+                        applicationContext, f.file, f.parent,
+                        bitrateRatio = videoPct / 100f
+                    )) {
+                        is com.wjbyt.j2h.video.VideoTranscoder.Result.Ok -> {
+                            done++
+                            appendLog("✓ $tag $name → ${r.outName} ${r.bytesIn / 1024 / 1024}MB→${r.bytesOut / 1024 / 1024}MB · ${r.note}")
+                        }
+                        is com.wjbyt.j2h.video.VideoTranscoder.Result.Skipped -> {
+                            skipped++
+                            appendLog("· $tag $name 跳过：${r.reason}")
+                        }
+                        is com.wjbyt.j2h.video.VideoTranscoder.Result.Failed -> {
+                            failed++
+                            appendLog("✗ $tag $name 失败：${r.reason}（已保留原文件）")
+                        }
+                    }
+                } else when (val r = converter.convert(f.file, f.parent)) {
                     is HeicConverter.Result.Ok -> {
                         done++
                         appendLog("✓ $tag $name → ${r.outName} ${r.bytesIn / 1024}KB→${r.bytesOut / 1024}KB · ${r.encoder}")

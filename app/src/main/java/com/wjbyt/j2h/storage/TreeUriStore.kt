@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.map
 private val Context.dataStore by preferencesDataStore(name = "tree_uris")
 private val KEY_URIS = stringSetPreferencesKey("uris")
 private val KEY_QUALITY = intPreferencesKey("heic_quality")
+private val KEY_VIDEO_RATIO_PCT = intPreferencesKey("video_bitrate_ratio_pct")
 
 class TreeUriStore(private val context: Context) {
 
@@ -62,4 +63,15 @@ class TreeUriStore(private val context: Context) {
     }
 
     suspend fun qualitySnapshot(): Int = quality.first()
+
+    /** AV1 video target bitrate as percent of source HEVC bitrate (20..100). */
+    val videoBitratePct: Flow<Int> = context.dataStore.data.map { prefs ->
+        (prefs[KEY_VIDEO_RATIO_PCT] ?: 60).coerceIn(20, 100)
+    }
+    suspend fun setVideoBitratePct(p: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_VIDEO_RATIO_PCT] = p.coerceIn(20, 100)
+        }
+    }
+    suspend fun videoBitratePctSnapshot(): Int = videoBitratePct.first()
 }

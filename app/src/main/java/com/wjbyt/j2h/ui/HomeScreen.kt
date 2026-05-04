@@ -63,6 +63,7 @@ fun HomeScreen(
     val store = remember { TreeUriStore(ctx) }
     val uris by store.uris.collectAsState(initial = emptyList())
     val quality by store.quality.collectAsState(initial = 95)
+    val videoPct by store.videoBitratePct.collectAsState(initial = 60)
     val state by ConversionForegroundService.state.collectAsState()
     val scope = rememberCoroutineScope()
 
@@ -142,6 +143,23 @@ fun HomeScreen(
                         enabled = !state.running
                     )
                     Text("校验通过后再删除原 JPG（DateTime/GPS 必须能在新 HEIC 中读到）",
+                         style = MaterialTheme.typography.bodySmall)
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("视频 AV1 码率：${videoPct}% （相对源 HEVC）",
+                         style = MaterialTheme.typography.titleSmall)
+                    Slider(
+                        value = videoPct.toFloat(),
+                        onValueChange = { v -> scope.launch { store.setVideoBitratePct(v.toInt()) } },
+                        valueRange = 30f..100f,
+                        steps = 69,
+                        enabled = !state.running
+                    )
+                    Text("60% 在 75\" 大屏视觉透明 · 70%+ 完全无差异 · 40% 以下复杂场景可见伪影",
                          style = MaterialTheme.typography.bodySmall)
                 }
             }

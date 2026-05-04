@@ -23,7 +23,11 @@ object JpgScanner {
                 walk(child, out)
             } else if (child.isFile) {
                 val name = child.name?.lowercase() ?: continue
-                if (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".dng")) {
+                if (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".dng") ||
+                    name.endsWith(".mp4") || name.endsWith(".mov")) {
+                    // Skip files we've already converted (avoid re-processing the .av1.mp4
+                    // that this app produces).
+                    if (name.endsWith(".av1.mp4")) continue
                     out += Found(child, dir)
                 }
             }
