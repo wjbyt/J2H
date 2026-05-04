@@ -20,8 +20,8 @@ import com.wjbyt.j2h.work.ConversionForegroundService
 class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* result not strictly required; we keep going either way */ }
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { /* whichever the user grants is fine */ }
 
     private val pickTreeLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -33,7 +33,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        maybeRequestNotifPermission()
+        requestRuntimePermissions()
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -50,10 +50,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun maybeRequestNotifPermission() {
-        if (Build.VERSION.SDK_INT >= 33) {
-            val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-            if (!granted) permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    private fun requestRuntimePermissions() {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed += Manifest.permission.POST_NOTIFICATIONS
         }
+        // Android 10+ — without this, the OS strips GPS values from EXIF when we
+        // read JPGs via ContentResolver, leaving only the IFD shell behind.
+        if (Build.VERSION.SDK_INT >= 29 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_MEDIA_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed += Manifest.permission.ACCESS_MEDIA_LOCATION
+        }
+        if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
     }
 }
