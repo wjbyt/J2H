@@ -292,12 +292,86 @@ object HeifExifInjector {
             ))
         }
 
-        return reorderMdatBeforeMeta(normalizeHvcCProfile(assemble(
+        return combineMdatAndTrailing(normalizeHvcCProfile(assemble(
             heicData, topBoxes, metaIdx, metaBox, subBoxes,
             newIinfBytes, newIrefBytes, irefBox, newIlocBytes,
             newIprpBytes, newPitmBytes,
             newMetaSize, exifBlock, thumbBytes
         )))
+    }
+
+    /**
+     * Like [reorderMdatBeforeMeta] but ALSO physically merges the trailing
+     * Exif/thumbnail blobs into mdat so the file ends cleanly with `free`,
+     * matching Samsung's `ftyp/mdat/meta/free` layout exactly.
+     *
+     * Why: Android's libstagefright HEIF parser (used by ExifInterface and
+     * MediaScanner) does NOT follow iloc absolute offsets into a degenerate
+     * trailing pseudo-box at the end of the file. Build #58's diagnostic
+     * confirmed: ExifInterface returns empty on our HEIC even though sips
+     * reads it fine. Putting the Exif item data inside mdat — where every
+     * parser looks for media payloads — fixes this.
+     *
+     * Layout transformation:
+     *   IN:  ftyp / meta / free / mdat / [Exif] / [thumb]
+     *   OUT: ftyp / mdat'(=tiles+Exif+thumb) / meta / free
+     * All iloc entries with construction_method=0 shift by -(meta_size +
+     * inter_free_size). File total size is unchanged.
+     */
+    private fun combineMdatAndTrailing(data: ByteArray): ByteArray {
+        val top = parseTopLevel(data)
+        val ftyp = top.firstOrNull { it.type == "ftyp" } ?: return data
+        val meta = top.firstOrNull { it.type == "meta" } ?: return data
+        val mdat = top.firstOrNull { it.type == "mdat" } ?: return data
+        if (mdat.offset < meta.offset) return data  // already in target order
+
+        val betweenMetaAndMdat = top.filter {
+            it.offset > meta.offset && it.offset < mdat.offset
+        }
+        val afterMdat = top.filter { it.offset >= mdat.offset + mdat.size }
+        val trailingSize = afterMdat.sumOf { it.size }.toInt()
+        if (trailingSize == 0) {
+            // No trailing blobs — fall back to plain reorder.
+            return reorderMdatBeforeMeta(data)
+        }
+
+        val newMdatStart = (ftyp.offset + ftyp.size).toInt()
+        val newMdatTotalSize = (mdat.size + trailingSize).toInt()
+        val shift = newMdatStart - mdat.offset.toInt()  // negative
+
+        // Patch every iloc entry whose extent currently lives at or after
+        // the OLD mdat start (i.e. tile entries AND trailing Exif/thumb
+        // entries) — they all need the same shift since both regions move
+        // together into the new combined mdat.
+        val patchedMeta = patchMetaIlocForMdatShift(
+            data, meta, mdat, shift,
+            extendShiftToTrailing = true
+        ) ?: return data
+
+        val out = ByteArrayOutputStream(data.size)
+        // ftyp
+        out.write(data, ftyp.offset.toInt(), ftyp.size.toInt())
+        // new mdat header (size + "mdat")
+        out.write(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+            .putInt(newMdatTotalSize).array())
+        out.write("mdat".toByteArray(Charsets.US_ASCII))
+        // old mdat content (skip its 8-byte header)
+        out.write(data, mdat.offset.toInt() + 8,
+                  mdat.size.toInt() - 8)
+        // trailing data (Exif + thumb), contiguous, becomes part of mdat
+        for (b in afterMdat) {
+            out.write(data, b.offset.toInt(), b.size.toInt())
+        }
+        // patched meta
+        out.write(patchedMeta)
+        // free (or other boxes that originally lived between meta and mdat)
+        for (b in betweenMetaAndMdat) {
+            out.write(data, b.offset.toInt(), b.size.toInt())
+        }
+        check(out.size() == data.size) {
+            "combineMdatAndTrailing size mismatch: ${out.size()} vs ${data.size}"
+        }
+        return out.toByteArray()
     }
 
     /**
@@ -432,7 +506,8 @@ object HeifExifInjector {
      * output).
      */
     private fun patchMetaIlocForMdatShift(
-        data: ByteArray, meta: RawBox, mdat: RawBox, mdatShift: Int
+        data: ByteArray, meta: RawBox, mdat: RawBox, mdatShift: Int,
+        extendShiftToTrailing: Boolean = false
     ): ByteArray? {
         val subStart = meta.payloadOffset + 4  // after meta version+flags
         val subEnd = meta.endOffset
@@ -442,19 +517,22 @@ object HeifExifInjector {
 
         val mdatStart = mdat.offset
         val mdatEnd = mdat.offset + mdat.size
-        // Patch entries whose extents land in the old mdat range.
+        // When merging trailing into mdat, ALL extents at or beyond the
+        // old mdat start need to shift (tiles AND Exif/thumb).
+        // When just reordering, only tile extents inside the old mdat range
+        // shift; trailing extents stay put.
+        fun shouldShift(abs: Long): Boolean =
+            if (extendShiftToTrailing) abs >= mdatStart
+            else abs in mdatStart until mdatEnd
         val newEntries = iloc.entries.map { e ->
             if (e.constructionMethod != 0) return@map e
-            // Either base_offset is non-zero (and its target is the start of
-            // a contiguous run inside mdat) or each extent has its own
-            // absolute offset.
-            if (iloc.baseOffsetSize > 0 && e.baseOffset in mdatStart until mdatEnd) {
+            if (iloc.baseOffsetSize > 0 && shouldShift(e.baseOffset)) {
                 e.copy(baseOffset = e.baseOffset + mdatShift)
             } else {
                 val newExtents = e.extents.map { x ->
                     val abs = (if (iloc.baseOffsetSize > 0) e.baseOffset else 0L) +
                                 x.extentOffset
-                    if (abs in mdatStart until mdatEnd) {
+                    if (shouldShift(abs)) {
                         x.copy(extentOffset = x.extentOffset + mdatShift)
                     } else x
                 }
