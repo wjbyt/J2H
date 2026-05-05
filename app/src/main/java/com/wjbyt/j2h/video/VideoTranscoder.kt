@@ -150,8 +150,8 @@ object VideoTranscoder {
             }
         }
 
-        // Open output via SAF.
-        existing?.delete()
+        // Open output via SAF. Stale temp from a previous interrupted run is
+        // cleaned up at the top of transcode(); no per-attempt delete here.
         val outFile = parent.createFile("video/mp4", targetName)
             ?: run { extractor.release(); return Result.Failed("无法创建输出文件") }
         val pfd = try {
