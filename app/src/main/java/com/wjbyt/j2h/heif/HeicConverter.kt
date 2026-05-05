@@ -300,11 +300,14 @@ class HeicConverter(
         val metaNote = if (mediaPath != null) {
             // MediaStore path: snapshot already merged into the row at insert
             // time; just set mtime so 时间 displays correctly in vivo gallery.
-            snapshot.dateTakenMillis?.let { ts ->
-                if (mediaPath.isNotBlank()) {
-                    try { java.io.File(mediaPath).setLastModified(ts) } catch (_: Exception) {}
-                }
-            }
+            val mtimeOk = snapshot.dateTakenMillis?.let { ts ->
+                if (mediaPath.isBlank()) false
+                else try { java.io.File(mediaPath).setLastModified(ts) }
+                     catch (_: Exception) { false }
+            } ?: false
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · mtime 设置: ${if (mtimeOk) "ok" else "fail"} (path=$mediaPath)"
+            )
             " [meta: ms-insert]"
         } else {
             MediaStoreSync.apply(context, outUri, snapshot)
@@ -388,15 +391,108 @@ class HeicConverter(
         }
 
         // Resolve to an absolute path so callers can setLastModified.
+        // MediaColumns.DATA is restricted on Android 11+ even for owned
+        // files; compute the path deterministically from RELATIVE_PATH +
+        // DISPLAY_NAME. Falls back to DATA if available.
+        val rootPath = android.os.Environment.getExternalStorageDirectory().absolutePath
+        val computedPath = "$rootPath/${relPath.trimEnd('/')}/$targetName"
         val absPath = try {
             resolver.query(uri, arrayOf(android.provider.MediaStore.MediaColumns.DATA),
                            null, null, null)?.use { c ->
                 if (c.moveToFirst()) c.getString(0) else null
             }
-        } catch (_: Exception) { null }
-        // We still consider the write a success even without the path —
-        // the row is created; mtime fix just won't apply.
-        return uri to (absPath ?: "")
+        } catch (_: Exception) { null } ?: computedPath
+
+        // Diagnostic dump: what does our row actually look like after
+        // insert+publish? Compare against a Samsung HEIC's row (which
+        // shows full make/model/GPS in vivo gallery) — that will reveal
+        // the vendor column names we must hit.
+        dumpRow(uri, "我们刚 insert 的行")
+        probeAnotherPopulatedRow(resolver, uri)
+        return uri to absPath
+    }
+
+    /** Print every non-empty column of [uri] to the log. */
+    private fun dumpRow(uri: android.net.Uri, label: String) {
+        try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (!c.moveToFirst()) {
+                    com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                        "  · $label: 行不存在")
+                    return
+                }
+                val sb = StringBuilder()
+                for (i in 0 until c.columnCount) {
+                    val name = c.getColumnName(i)
+                    val v = try { c.getString(i) } catch (_: Exception) { null }
+                    if (!v.isNullOrBlank() && v != "0") {
+                        sb.append(name).append('=').append(v.take(40)).append("; ")
+                    }
+                }
+                com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                    "  · $label: $sb")
+            }
+        } catch (e: Exception) {
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · $label 查询失败: ${e.message?.take(60)}")
+        }
+    }
+
+    /**
+     * Find a different image row that vivo's MediaScanner DID populate
+     * with EXIF (i.e. has a latitude or make-like value). Dumping it
+     * exposes the exact vendor column names we need to match.
+     */
+    private fun probeAnotherPopulatedRow(
+        resolver: android.content.ContentResolver, ourUri: android.net.Uri
+    ) {
+        try {
+            val collection = android.provider.MediaStore.Images.Media
+                .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            // Pick any image NOT owned by us — that's a Samsung-style
+            // file that MediaScanner extracted EXIF from natively.
+            val sel = "owner_package_name IS NULL OR owner_package_name != ?"
+            val args = arrayOf(context.packageName)
+            resolver.query(collection, null, sel, args,
+                           "${android.provider.MediaStore.MediaColumns.DATE_MODIFIED} DESC LIMIT 5")
+                ?.use { c ->
+                    var picked = false
+                    while (c.moveToNext()) {
+                        // Has any non-empty geo/make-like column?
+                        var interesting = false
+                        for (i in 0 until c.columnCount) {
+                            val name = c.getColumnName(i).lowercase()
+                            if (name in setOf("latitude", "longitude", "make",
+                                              "manufacturer", "datetaken")) {
+                                val v = try { c.getString(i) } catch (_: Exception) { null }
+                                if (!v.isNullOrBlank() && v != "0" && v != "0.0") {
+                                    interesting = true; break
+                                }
+                            }
+                        }
+                        if (!interesting) continue
+                        picked = true
+                        val sb = StringBuilder()
+                        for (i in 0 until c.columnCount) {
+                            val name = c.getColumnName(i)
+                            val v = try { c.getString(i) } catch (_: Exception) { null }
+                            if (!v.isNullOrBlank() && v != "0" && v != "0.0") {
+                                sb.append(name).append('=').append(v.take(35)).append("; ")
+                            }
+                        }
+                        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                            "  · 别人的行 (供参考): $sb")
+                        break
+                    }
+                    if (!picked) {
+                        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                            "  · 找不到第三方写入且包含 EXIF 的图像行")
+                    }
+                }
+        } catch (e: Exception) {
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · 探针查询失败: ${e.message?.take(60)}")
+        }
     }
 
     /** "Download/照片/" from a SAF tree URI for primary external storage. */
