@@ -5,6 +5,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.media.MediaScannerConnection
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -55,32 +56,61 @@ object MediaStoreSync {
 
     /**
      * Push [snap] onto the new HEIC at [newHeicUri]. Best-effort:
-     *  - Set the file's mtime to the shot time (gallery time-sort fallback).
-     *  - Trigger MediaScanner; in the callback update DATE_TAKEN (and GPS where supported).
+     *  - Set the file's mtime to the shot time. vivo gallery's "时间" panel
+     *    reads mtime, not EXIF DateTime, so this is what makes the shoot time
+     *    appear instead of the conversion time.
+     *  - Trigger MediaScanner; in the callback update DATE_TAKEN, GPS, MAKE,
+     *    MODEL columns so vendor galleries that consult MediaStore see them.
      *
-     * Returns a short message describing what was done, for the user-visible log.
+     * Both ops require MANAGE_EXTERNAL_STORAGE on Android 11+ because our
+     * SAF-written files are owned by DocumentsUI, not us. The result string
+     * tells us in the user-visible log exactly which steps succeeded.
      */
     fun apply(context: Context, newHeicUri: Uri, snap: Snapshot): String {
         val parts = mutableListOf<String>()
         val path = pathFromSafUri(newHeicUri)
-
-        // 1) File mtime — this alone is enough for many galleries to time-sort correctly,
-        // even if the MediaStore step below fails.
-        snap.dateTakenMillis?.let { ts ->
-            if (path != null) {
-                try {
-                    if (java.io.File(path).setLastModified(ts)) parts += "mtime=ok"
-                    else parts += "mtime=denied"
-                } catch (e: Exception) { parts += "mtime=${e.message}" }
-            }
+        if (path == null) {
+            return " [meta: path-resolve-failed]"
         }
 
-        // 2) MediaScanner: gives us the MediaStore URI; populate DATE_TAKEN there so the
-        // vivo gallery shows the correct shot time in the photo's info panel.
-        if (path != null && (snap.dateTakenMillis != null || snap.gpsLat != null)) {
+        val hasAllFilesAccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+            Environment.isExternalStorageManager() else true
+        if (!hasAllFilesAccess) parts += "no-all-files-access"
+
+        // 1) File mtime → shot time. This is the single most-impactful change
+        // for vivo's gallery: their info panel displays this value as 时间.
+        snap.dateTakenMillis?.let { ts ->
+            try {
+                val ok = java.io.File(path).setLastModified(ts)
+                parts += if (ok) "mtime=ok" else "mtime=denied"
+                // Some kernels reject setLastModified silently; try Os.utimes
+                // as a backup if the boolean said denied.
+                if (!ok) {
+                    try {
+                        android.system.Os.utimes(path,
+                            doubleArrayOf((ts / 1000).toDouble(),
+                                          (ts / 1000).toDouble()))
+                        parts += "utimes=ok"
+                    } catch (e: Exception) {
+                        parts += "utimes=${e.message?.take(30)}"
+                    }
+                }
+            } catch (e: Exception) { parts += "mtime=${e.message?.take(30)}" }
+        }
+
+        // 2) MediaScanner: gives us the MediaStore URI; populate the rich
+        // columns there so vendor galleries see make/model/GPS.
+        if (snap.dateTakenMillis != null || snap.gpsLat != null ||
+            snap.make != null || snap.model != null) {
             val cv = ContentValues().apply {
-                snap.dateTakenMillis?.let { put(MediaStore.Images.Media.DATE_TAKEN, it) }
-                // LATITUDE/LONGITUDE columns were removed in API 29; ignore failures.
+                snap.dateTakenMillis?.let {
+                    put(MediaStore.Images.Media.DATE_TAKEN, it)
+                    // Some galleries time-sort on DATE_MODIFIED instead.
+                    put(MediaStore.Images.Media.DATE_MODIFIED, it / 1000)
+                }
+                // LATITUDE/LONGITUDE were removed from public API in 29 but
+                // most vendor MediaStores keep them — try anyway, swallow
+                // SQLiteException if the column doesn't exist.
                 snap.gpsLat?.let { put("latitude", it) }
                 snap.gpsLon?.let { put("longitude", it) }
             }
@@ -89,12 +119,24 @@ object MediaStoreSync {
                     context, arrayOf(path), arrayOf("image/heic")
                 ) { _, scannedUri ->
                     if (scannedUri != null) {
-                        try { context.contentResolver.update(scannedUri, cv, null, null) }
-                        catch (_: Exception) { /* GPS columns may not exist on newer APIs */ }
+                        try {
+                            val n = context.contentResolver.update(scannedUri, cv, null, null)
+                            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                                "  · MediaStore 更新 $scannedUri → $n 行"
+                            )
+                        } catch (e: Exception) {
+                            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                                "  · MediaStore 更新失败: ${e.message?.take(80)}"
+                            )
+                        }
+                    } else {
+                        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                            "  · MediaScanner 扫描完成但未返回 URI（vendor MediaStore 拒绝索引？）"
+                        )
                     }
                 }
                 parts += "scan=requested"
-            } catch (e: Exception) { parts += "scan=${e.message}" }
+            } catch (e: Exception) { parts += "scan=${e.message?.take(30)}" }
         }
         return if (parts.isEmpty()) "" else " [meta: ${parts.joinToString(", ")}]"
     }

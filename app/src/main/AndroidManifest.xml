@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
@@ -10,6 +11,16 @@
          IFD structure (tags/types/counts) survives — the actual lat/lon/alt
          values get redacted to 0/0 for privacy. -->
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION"/>
+
+    <!-- Needed on Android 11+ so we can:
+         (a) set the converted file's mtime to the original photo's shoot time
+             (vivo gallery shows mtime in the photo info panel as 时间), and
+         (b) update MediaStore.Images.Media columns for files we don't directly
+             own (SAF-written outputs are owned by DocumentsUI, so plain
+             MediaStore.update() throws SecurityException without this).
+         User must grant via Settings → All files access. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+                     tools:ignore="ScopedStorage"/>
 
     <application
         android:label="@string/app_name"

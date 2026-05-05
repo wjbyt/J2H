@@ -45,10 +45,11 @@ object HeicMetadataRepair {
     }
 
     /**
-     * Returns (newBytes, patchedItemCount).
-     * - Sets infe flag bit 0 on every Exif item.
-     * - Sets infe flag bit 0 on every hvc1 item ONLY when the file has a 'grid'
-     *   item (meaning the hvc1's are tiles, not the displayable primary).
+     * Returns (newBytes, patchedItemCount). Patches:
+     * - hvc1 tiles (when a 'grid' item exists) → hidden (bit 0 set)
+     * - Exif item → NOT hidden (bit 0 cleared). HEIF spec reserves the
+     *   hidden flag for image items; metadata items shouldn't carry it,
+     *   and some galleries skip lookup of items that do.
      */
     private fun patchInfeFlags(data: ByteArray): Pair<ByteArray, Int> {
         val top = parseTopLevel(data)
@@ -69,13 +70,21 @@ object HeicMetadataRepair {
         val out = data.copyOf()
         var patched = 0
         forEachInfe(data, iinf) { infeOffset, type, currentFlags ->
-            val shouldHide = type == "Exif" || (hasGrid && type == "hvc1")
-            if (shouldHide && (currentFlags and 1) == 0) {
-                // flag bytes at infeOffset+9, +10, +11 (after 4-byte size + 4-byte type
-                // + 1-byte version). Set bit 0 of the third flag byte.
-                val byteIndex = infeOffset + 11
-                out[byteIndex] = (out[byteIndex].toInt() or 0x01).toByte()
-                patched++
+            // flag bytes at infeOffset+9, +10, +11 (after 4-byte size + 4-byte
+            // type + 1-byte version). Bit 0 of the third flag byte is "hidden".
+            val byteIndex = infeOffset + 11
+            val isHidden = (currentFlags and 1) != 0
+            when {
+                type == "Exif" && isHidden -> {
+                    // Clear hidden bit so galleries pick the metadata up.
+                    out[byteIndex] = (out[byteIndex].toInt() and 0xFE).toByte()
+                    patched++
+                }
+                hasGrid && type == "hvc1" && !isHidden -> {
+                    // Tiles must be hidden so they aren't displayed individually.
+                    out[byteIndex] = (out[byteIndex].toInt() or 0x01).toByte()
+                    patched++
+                }
             }
         }
         return out to patched

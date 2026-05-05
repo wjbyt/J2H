@@ -184,6 +184,21 @@ class ConversionForegroundService : Service() {
                         appendLog("✗ $name 失败：${r.reason}")
                     }
                 }
+                // Whether or not byte-flag patching changed anything, push the
+                // HEIC's own EXIF DateTime into file mtime + MediaStore so that
+                // vivo gallery shows the correct shoot time. This is the
+                // user-visible fix even on files that didn't need a byte patch.
+                try {
+                    val snap = com.wjbyt.j2h.heif.MediaStoreSync.readSourceJpg(
+                        applicationContext, f.file
+                    )
+                    if (snap.dateTakenMillis != null) {
+                        val note = com.wjbyt.j2h.heif.MediaStoreSync.apply(
+                            applicationContext, f.file.uri, snap
+                        )
+                        if (note.isNotBlank()) appendLog("  $name$note")
+                    }
+                } catch (_: Throwable) { /* best-effort */ }
             } catch (e: Throwable) {
                 failed++
                 appendLog("✗ $name 异常：${e.javaClass.simpleName} ${e.message}")
