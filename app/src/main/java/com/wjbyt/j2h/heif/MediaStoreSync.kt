@@ -134,6 +134,44 @@ object MediaStoreSync {
                         return@scanFile
                     }
                     val cr = context.contentResolver
+                    // Diagnostic: read back the row vivo wrote during the
+                    // scan to see whether MediaScanner extracted EXIF on its
+                    // own. If the row already has make/model/GPS populated,
+                    // the gallery's empty display is a vendor reader bug
+                    // (we can't fix). If it's empty, MediaScanner failed to
+                    // extract — and we need a different write path.
+                    try {
+                        cr.query(scannedUri, null, null, null, null)?.use { c ->
+                            if (c.moveToFirst()) {
+                                val interesting = listOf(
+                                    "make", "model", "manufacturer", "device",
+                                    "latitude", "longitude",
+                                    "gps_latitude", "gps_longitude",
+                                    "datetaken", "date_taken",
+                                    "datetime", "exif_datetime",
+                                    "owner_package_name", "is_pending",
+                                    "_data", "mime_type", "width", "height"
+                                )
+                                val sb = StringBuilder()
+                                for (i in 0 until c.columnCount) {
+                                    val name = c.getColumnName(i).lowercase()
+                                    if (name !in interesting) continue
+                                    val v = try { c.getString(i) } catch (_: Exception) { null }
+                                    if (!v.isNullOrBlank() && v != "0") {
+                                        sb.append(name).append('=')
+                                          .append(v.take(40)).append("; ")
+                                    }
+                                }
+                                com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                                    "  · MediaStore 行内容: $sb"
+                                )
+                            }
+                        }
+                    } catch (e: Exception) {
+                        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                            "  · MediaStore 查询失败: ${e.message?.take(60)}"
+                        )
+                    }
                     // Step A: standard columns in one shot.
                     val baseRows = try {
                         cr.update(scannedUri, baseCv, null, null)
