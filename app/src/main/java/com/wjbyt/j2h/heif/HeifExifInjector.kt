@@ -292,12 +292,57 @@ object HeifExifInjector {
             ))
         }
 
-        return reorderMdatBeforeMeta(assemble(
+        return reorderMdatBeforeMeta(normalizeHvcCProfile(assemble(
             heicData, topBoxes, metaIdx, metaBox, subBoxes,
             newIinfBytes, newIrefBytes, irefBox, newIlocBytes,
             newIprpBytes, newPitmBytes,
             newMetaSize, exifBlock, thumbBytes
-        ))
+        )))
+    }
+
+    /**
+     * Patch hvcC's `profile_space_tier_idc` byte from "Main Still Picture"
+     * (profile_idc=3, what HeifWriter writes) to "Main" (profile_idc=1, what
+     * Samsung writes). Also OR in bit 30 of profile_compatibility_flags so
+     * the config claims Main compatibility, matching Samsung's 0x60000000.
+     *
+     * This is the last structural difference between our HEIC and Samsung's
+     * after the renumbering. The underlying HEVC bitstream is unaffected
+     * (Main Still Picture is a strict subset of Main, so any Main decoder
+     * accepts it). vivo's MediaScanner may use the hvcC config as a gate to
+     * decide whether to extract EXIF.
+     */
+    private fun normalizeHvcCProfile(data: ByteArray): ByteArray {
+        val top = parseTopLevel(data)
+        val meta = top.firstOrNull { it.type == "meta" } ?: return data
+        val subStart = meta.payloadOffset + 4
+        val subEnd = meta.endOffset
+        val subs = parseBoxList(data, subStart, subEnd)
+        val iprp = subs.firstOrNull { it.type == "iprp" } ?: return data
+        val ipsubs = parseBoxList(data, iprp.payloadOffset, iprp.endOffset)
+        val ipco = ipsubs.firstOrNull { it.type == "ipco" } ?: return data
+        val props = parseBoxList(data, ipco.payloadOffset, ipco.endOffset)
+        val out = data.copyOf()
+        var patched = 0
+        for (p in props) {
+            if (p.type != "hvcC") continue
+            val ptiOff = (p.payloadOffset + 1).toInt()
+            // Force Main profile (idc=1), preserve profile_space + tier bits.
+            val orig = out[ptiOff].toInt() and 0xFF
+            val keepSpaceTier = orig and 0xE0   // top 3 bits
+            val newByte = (keepSpaceTier or 0x01) and 0xFF
+            if (orig != newByte) {
+                out[ptiOff] = newByte.toByte()
+                patched++
+            }
+            // Also force tier=0 (Main tier) so hvcC matches Samsung's 0x01
+            // exactly. HeifWriter emits 0x21 (high tier) for thumbnails.
+            out[ptiOff] = (out[ptiOff].toInt() and 0x9F).toByte()
+            // Set profile_compatibility_flags bit 30 (Main compat).
+            val compatOff = (p.payloadOffset + 2).toInt()
+            out[compatOff] = (out[compatOff].toInt() or 0x40).toByte()
+        }
+        return out
     }
 
     private fun parsePitmVersion(data: ByteArray, box: RawBox): Int =
