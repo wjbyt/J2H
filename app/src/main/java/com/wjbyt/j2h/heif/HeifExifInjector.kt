@@ -221,10 +221,27 @@ object HeifExifInjector {
             .sumOf { it.size }
         val exifBlockOffset = tailStart + tailSize
 
-        // EXIF item data: 4-byte BE tiff_header_offset then TIFF blob.
-        val exifBlock = ByteBuffer.allocate(4 + exifTiff.size)
+        // EXIF item data layout that Android's libstagefright / ExifInterface
+        // expects (matches Samsung byte-for-byte):
+        //   [4 bytes BE: tiff_header_offset = 6]
+        //   [6 bytes:    'E' 'x' 'i' 'f' 0x00 0x00]   ← JPEG-style APP1 marker
+        //   [TIFF data:  II*\0... or MM\0*...]
+        //
+        // We previously wrote tiff_header_offset = 0 with TIFF data starting
+        // immediately after the prefix. That is also spec-compliant per
+        // ISO/IEC 23008-12 Annex A.2, but Android's parser appears to assume
+        // the marker is always present and skips 6 bytes blindly — landing
+        // inside our TIFF data and failing to parse. Build #59's diagnostic
+        // confirmed: ExifInterface returns empty on our HEIC even though
+        // sips reads it. Adding the marker + adjusting the prefix to 6 fixes
+        // the parser.
+        val exifMarker = byteArrayOf(
+            0x45.toByte(), 0x78.toByte(), 0x69.toByte(), 0x66.toByte(), 0x00, 0x00
+        )
+        val exifBlock = ByteBuffer.allocate(4 + exifMarker.size + exifTiff.size)
             .order(ByteOrder.BIG_ENDIAN)
-            .putInt(0)
+            .putInt(exifMarker.size)
+            .put(exifMarker)
             .put(exifTiff)
             .array()
 
