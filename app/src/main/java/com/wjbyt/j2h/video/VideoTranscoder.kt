@@ -184,18 +184,45 @@ object VideoTranscoder {
                         "  · CQ 模式 质量=$q (encoder range ${qRange.lower}..${qRange.upper})"
                     )
                 } else {
-                    // Fall back to VBR with a sensible bitrate target derived from the
-                    // qualityPct (interpret as bitrate ratio of source).
-                    val sourceBitrate = if (videoFormat.containsKey(MediaFormat.KEY_BIT_RATE))
-                        videoFormat.getInteger(MediaFormat.KEY_BIT_RATE)
-                    else (w.toLong() * h * frameRate / 4).toInt()
-                    val target = (sourceBitrate * qualityPct.coerceIn(20, 100) / 100)
-                        .coerceAtLeast(1_000_000)
+                    // Fall back to VBR. We cannot trust KEY_BIT_RATE: vivo's
+                    // recorder sometimes omits it or reports something nonsense
+                    // (we previously hit this and produced 1 Mbps output for a
+                    // 50 Mbps source because Int overflow killed the math). So
+                    // we compute a per-pixel-per-frame target instead, derived
+                    // from common HEVC "visually transparent" rates:
+                    //   • SDR 8-bit  HEVC ≈ 0.04 bpp/frame transparent
+                    //   • HDR 10-bit HEVC ≈ 0.06 bpp/frame transparent
+                    // The qualityPct slider scales that target. We never go
+                    // below a sensible per-resolution floor.
+                    val pixelsPerFrame = w.toLong() * h
+                    // Calibrated so qualityPct = 70 lands at the rule-of-thumb
+                    // "visually transparent" rate for HEVC re-encoding (~0.06
+                    // bpp/frame HDR, ~0.04 bpp/frame SDR). qualityPct = 100
+                    // gives ~40 % headroom over that for big-TV viewing.
+                    val baseBppPerFrame = if (isHdr) 0.085 else 0.06
+                    val qScale = (qualityPct.coerceIn(30, 100)) / 100.0
+                    // Default qualityPct=70 → 70 % of "transparent" ≈ still
+                    // visually transparent for re-encoded content; 100 % = the
+                    // full transparent target; below 50 % gets aggressive.
+                    val targetLong = (pixelsPerFrame * frameRate *
+                        baseBppPerFrame * qScale).toLong()
+                    val floorBps = if (pixelsPerFrame >= 3840L * 2000) 8_000_000L
+                                   else if (pixelsPerFrame >= 1920L * 1000) 3_000_000L
+                                   else 1_500_000L
+                    val capBps = 200_000_000L
+                    val target = targetLong
+                        .coerceAtLeast(floorBps)
+                        .coerceAtMost(capBps)
+                        .toInt()
                     encoderFormat.setInteger(MediaFormat.KEY_BIT_RATE, target)
                     encoderFormat.setInteger(MediaFormat.KEY_BITRATE_MODE,
                         MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                    val srcBr = if (videoFormat.containsKey(MediaFormat.KEY_BIT_RATE))
+                        videoFormat.getInteger(MediaFormat.KEY_BIT_RATE) else 0
                     com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
-                        "  · CQ 不支持，回退 VBR 目标码率 ${target / 1000} kbps"
+                        "  · CQ 不支持，回退 VBR ${target / 1000} kbps " +
+                        "(${if (isHdr) "HDR" else "SDR"} ${w}x${h}@${frameRate}, " +
+                        "源码率=${if (srcBr > 0) "${srcBr/1000} kbps" else "未知"})"
                     )
                 }
             } catch (e: Exception) {
