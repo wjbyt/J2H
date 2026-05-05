@@ -325,11 +325,17 @@ object HeifExifInjector {
     }
 
     /**
-     * Returns a fresh meta box (header + payload) where every iloc
-     * extent_offset that pointed into the old mdat range has been shifted
-     * by [mdatShift]. Returns null if the iloc field widths cannot
-     * accommodate the shifted values without growing (caller should fall
-     * back to the un-reordered output).
+     * Returns a fresh meta box (header + payload) where:
+     *  (a) every iloc extent_offset that pointed into the old mdat range has
+     *      been shifted by [mdatShift]
+     *  (b) the meta sub-boxes are emitted in Samsung's canonical order
+     *      (hdlr / iinf / pitm / iprp / iloc / idat / iref). HeifWriter
+     *      otherwise emits them in (hdlr / iloc / iinf / pitm / iprp / idat
+     *      / iref), and vivo's MediaScanner appears to depend on the former.
+     *
+     * Returns null if the iloc field widths cannot accommodate the shifted
+     * values without growing (caller should fall back to the un-reordered
+     * output).
      */
     private fun patchMetaIlocForMdatShift(
         data: ByteArray, meta: RawBox, mdat: RawBox, mdatShift: Int
@@ -369,13 +375,22 @@ object HeifExifInjector {
             return null
         }
 
-        // Splice the new iloc bytes into the meta box.
+        // Reorder sub-boxes to Samsung's canonical layout. Boxes whose type
+        // is not in the list (rare extensions) keep their relative position
+        // at the end.
+        val canonical = listOf("hdlr", "iinf", "pitm", "iprp", "iloc", "idat", "iref")
+        val sortedSubs = subs.sortedBy {
+            val idx = canonical.indexOf(it.type)
+            if (idx < 0) canonical.size else idx
+        }
+
+        // Splice the new iloc bytes into the meta box, in canonical order.
         val out = ByteArray(meta.size.toInt())
         // 1. meta header + version+flags
         System.arraycopy(data, meta.offset.toInt(), out, 0, (subStart - meta.offset).toInt())
-        // 2. sub-boxes, replacing iloc
+        // 2. sub-boxes in canonical order, replacing iloc bytes
         var writePos = (subStart - meta.offset).toInt()
-        for (sub in subs) {
+        for (sub in sortedSubs) {
             if (sub.type == "iloc") {
                 System.arraycopy(newIlocBytes, 0, out, writePos, newIlocBytes.size)
                 writePos += newIlocBytes.size

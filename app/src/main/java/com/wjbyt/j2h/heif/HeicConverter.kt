@@ -117,6 +117,16 @@ class HeicConverter(
                     hwBytes
                 }
             } else hwBytes
+
+            // Diagnostic: print top-level box order so we can verify on-device
+            // that the mdat-before-meta reorder actually applied. Samsung's
+            // HEIC is ftyp/mdat/meta/free; HeifWriter raw output is
+            // ftyp/meta/free/mdat. After our injector + reorder it should
+            // match Samsung's order.
+            describeTopLevel(finalBytes)?.let {
+                com.wjbyt.j2h.work.ConversionForegroundService
+                    .appendLog("  · 最终顶层布局: $it")
+            }
             return writeAndVerify("HeifWriter-8bit", finalBytes, parent, targetName, jpg, snapshot)
                 ?: Result.Failed("HEIC 解码失败（图片可能超出本机 HEVC 解码能力）",
                                  keepOriginal = true)
@@ -312,5 +322,38 @@ class HeicConverter(
             test.recycle()
             return null
         } finally { tmp.delete() }
+    }
+
+    /** Returns "ftyp+24 / mdat+12345 / meta+456 / ..." or null on parse error. */
+    private fun describeTopLevel(data: ByteArray): String? {
+        return try {
+            val sb = StringBuilder()
+            var p = 0
+            var first = true
+            while (p < data.size - 8) {
+                val sz32 = ((data[p].toLong() and 0xFF) shl 24) or
+                           ((data[p+1].toLong() and 0xFF) shl 16) or
+                           ((data[p+2].toLong() and 0xFF) shl 8) or
+                            (data[p+3].toLong() and 0xFF)
+                val type = String(data, p+4, 4, Charsets.US_ASCII)
+                    .replace(' ', '?')
+                val size: Long = when (sz32) {
+                    1L -> {
+                        if (p + 16 > data.size) return null
+                        var v = 0L
+                        for (k in 0 until 8) v = (v shl 8) or (data[p+8+k].toLong() and 0xFF)
+                        v
+                    }
+                    0L -> (data.size - p).toLong()
+                    else -> sz32
+                }
+                if (size < 8 || p + size > data.size) return null
+                if (!first) sb.append(" / ")
+                sb.append(type).append('+').append(size)
+                first = false
+                p += size.toInt()
+            }
+            sb.toString()
+        } catch (_: Exception) { null }
     }
 }
