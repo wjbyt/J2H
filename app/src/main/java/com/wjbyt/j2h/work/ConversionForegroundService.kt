@@ -160,7 +160,11 @@ class ConversionForegroundService : Service() {
         val files = mutableListOf<JpgScanner.Found>()
         for (u in uris) files += JpgScanner.scan(applicationContext, u)
         val heicFiles = files.filter { it.file.name?.lowercase()?.endsWith(".heic") == true }
-        if (heicFiles.isEmpty()) { appendLog("未发现 HEIC 文件"); return }
+        if (heicFiles.isEmpty()) {
+            appendLog("未发现 HEIC 文件")
+            _state.value = _state.value.copy(running = false, current = "")
+            return
+        }
         _state.value = _state.value.copy(total = heicFiles.size)
         appendLog("共发现 ${heicFiles.size} 张 HEIC，开始修复元数据…")
 
@@ -273,10 +277,23 @@ class ConversionForegroundService : Service() {
         val dngCount = files.count { (it.file.name?.lowercase() ?: "").endsWith(".dng") }
         val videoCount = files.count {
             val n = it.file.name?.lowercase() ?: ""
-            (n.endsWith(".mp4") || n.endsWith(".mov")) && !n.endsWith(".av1.mp4")
+            n.endsWith(".mp4") || n.endsWith(".mov")
         }
-        _state.value = _state.value.copy(total = files.size)
-        appendLog("共发现 ${files.size} 个文件（JPG: $jpgCount, DNG: $dngCount, 视频: $videoCount），开始转换…")
+        val heicCount = files.count { (it.file.name?.lowercase() ?: "").endsWith(".heic") }
+        // Skip already-HEIC files in the conversion flow — they belong to the
+        // repair flow, not here. Without this filter HeicConverter would try
+        // to re-encode them as JPEG-source HEICs and fail.
+        val toConvert = files.filter {
+            (it.file.name?.lowercase() ?: "").let { n -> !n.endsWith(".heic") }
+        }
+        _state.value = _state.value.copy(total = toConvert.size)
+        val heicNote = if (heicCount > 0) ", HEIC: $heicCount 已跳过—改用『修复』" else ""
+        appendLog("共发现 ${files.size} 个文件（JPG: $jpgCount, DNG: $dngCount, 视频: $videoCount$heicNote），开始转换…")
+        if (toConvert.isEmpty()) {
+            appendLog("无可转换文件（HEIC 文件请使用『修复』按钮）")
+            _state.value = _state.value.copy(running = false, current = "")
+            return
+        }
 
         val quality = store.qualitySnapshot()
         val videoPct = store.videoBitratePctSnapshot()
@@ -287,19 +304,21 @@ class ConversionForegroundService : Service() {
         }
         val converter = HeicConverter(applicationContext, quality = quality)
         var done = 0; var failed = 0; var skipped = 0
-        for ((idx, f) in files.withIndex()) {
+        for ((idx, f) in toConvert.withIndex()) {
             if (!currentCoroutineContext().isActive) break
             val name = f.file.name ?: "?"
             val lower = name.lowercase()
             val isVideo = (lower.endsWith(".mp4") || lower.endsWith(".mov")) &&
-                          !lower.endsWith(".compressed.mp4") && !lower.endsWith(".av1.mp4")
+                          !lower.endsWith(".compressed.mp4") &&
+                          !lower.endsWith(".av1.mp4") &&
+                          !lower.endsWith(".j2h.mp4")
             val tag = when {
                 isVideo -> "[VID→HEVC ]"
                 lower.endsWith(".dng") -> "[DNG→10bit]"
                 else -> "[JPG→8bit ]"
             }
             _state.value = _state.value.copy(current = "$tag $name")
-            updateNotification("正在转换 ($idx/${files.size}): $name", idx, files.size)
+            updateNotification("正在转换 ($idx/${toConvert.size}): $name", idx, toConvert.size)
             try {
                 if (isVideo) {
                     when (val r = com.wjbyt.j2h.video.VideoTranscoder.transcode(
@@ -353,7 +372,7 @@ class ConversionForegroundService : Service() {
                 done = done, failed = failed, skipped = skipped
             )
         }
-        updateNotification("完成：成功 $done · 失败 $failed · 跳过 $skipped", files.size, files.size)
+        updateNotification("完成：成功 $done · 失败 $failed · 跳过 $skipped", toConvert.size, toConvert.size)
         appendLog("==== 完成：成功 $done，失败 $failed，跳过 $skipped ====")
         _state.value = _state.value.copy(running = false, current = "")
     }

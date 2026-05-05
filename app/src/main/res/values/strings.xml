@@ -11,7 +11,7 @@
     <string name="status_running">正在转换</string>
     <string name="status_done">完成</string>
     <string name="quality_label">HEIC 质量：95</string>
-    <string name="delete_after_label">校验通过后删除原 JPG</string>
+    <string name="delete_after_label">校验通过后删除原文件</string>
     <string name="notif_channel_name">转换进度</string>
     <string name="notif_channel_desc">显示后台转换的进度</string>
     <string name="notif_title">JPG → HEIC 正在转换</string>

@@ -23,10 +23,13 @@ object JpgScanner {
                 walk(child, out)
             } else if (child.isFile) {
                 val name = child.name?.lowercase() ?: continue
+                // Skip files we've already produced (avoid re-processing the
+                // same video on subsequent runs).
+                if (name.endsWith(".j2h.mp4") || name.endsWith(".compressed.mp4") ||
+                    name.endsWith(".av1.mp4")) continue
                 if (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".dng") ||
+                    name.endsWith(".heic") ||
                     name.endsWith(".mp4") || name.endsWith(".mov")) {
-                    // Skip files we've already produced (avoid re-processing).
-                    if (name.endsWith(".compressed.mp4") || name.endsWith(".av1.mp4")) continue
                     out += Found(child, dir)
                 }
             }

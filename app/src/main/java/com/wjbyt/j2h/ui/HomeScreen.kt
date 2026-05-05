@@ -155,7 +155,7 @@ fun HomeScreen(
                         steps = 49,
                         enabled = !state.running
                     )
-                    Text("校验通过后再删除原 JPG（DateTime/GPS 必须能在新 HEIC 中读到）",
+                    Text("校验通过后再删除原文件（DateTime/GPS 必须能在新 HEIC 中读到）",
                          style = MaterialTheme.typography.bodySmall)
                 }
             }
@@ -172,7 +172,7 @@ fun HomeScreen(
                         steps = 69,
                         enabled = !state.running
                     )
-                    Text("70 ≈ 视觉透明（推荐）· 90+ 完全保真 · 50 以下激进压缩",
+                    Text("70 ≈ 流媒体级（4K HDR ~10 Mbps，推荐）· 90+ 接近原片 · 50 以下激进压缩",
                          style = MaterialTheme.typography.bodySmall)
                 }
             }
