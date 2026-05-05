@@ -57,10 +57,16 @@ object VideoTranscoder {
     ): Result {
         val srcName = input.name ?: return Result.Failed("no name")
         val baseName = srcName.substringBeforeLast('.', srcName)
-        val targetName = "$baseName.compressed.mp4"
+        // We encode to a temporary name first so the encoder doesn't collide
+        // with the source file (which still exists in the same folder until
+        // verification passes). After verification we delete the source and
+        // rename the temp file to take its place — user ends up with one
+        // file at the original path with compressed contents.
+        val finalName = srcName  // the name the user sees in the end
+        val targetName = "$baseName.j2h-tmp.mp4"
 
-        val existing = parent.findFile(targetName)
-        if (existing != null && existing.length() > 0) return Result.Skipped("$targetName 已存在")
+        // Carry-over from a previous interrupted run.
+        parent.findFile(targetName)?.delete()
 
         val extractor = MediaExtractor()
         try {
@@ -402,15 +408,33 @@ object VideoTranscoder {
 
             val srcSize = input.length()
             val outSize = outFile.length()
-            // Mirror source mtime.
-            try { java.io.File(safPath(outFile.uri))?.setLastModified(input.lastModified()) }
-            catch (_: Exception) {}
+            val srcMtime = input.lastModified()
+            // Source must go first so its name frees up for the rename below.
             if (!input.delete()) {
                 return Result.Failed("已转码但删除原视频失败", keepOriginal = true)
             }
+            // Rename the temp file to the original name. SAF's
+            // DocumentsContract.renameDocument is the right API on Android
+            // 21+. Falls back to keeping the temp name if the provider
+            // refuses (rare for ExternalStorageDocumentsProvider).
+            val displayedName: String = try {
+                val newUri = android.provider.DocumentsContract.renameDocument(
+                    context.contentResolver, outFile.uri, finalName
+                )
+                if (newUri != null) finalName else targetName
+            } catch (e: Exception) {
+                com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                    "  · 重命名失败，保留临时名 $targetName: ${e.message?.take(60)}"
+                )
+                targetName
+            }
+            // Mirror source mtime onto the renamed file (path may have moved).
+            val finalPath = safPath(parent.findFile(displayedName)?.uri ?: outFile.uri)
+            try { if (finalPath != null) java.io.File(finalPath).setLastModified(srcMtime) }
+            catch (_: Exception) {}
             val saved = if (srcSize > 0) (100 - outSize * 100 / srcSize) else 0L
             val dvNote = if (isDolbyVisionInput) "（DV→HDR10+）" else ""
-            return Result.Ok(targetName, srcSize, outSize,
+            return Result.Ok(displayedName, srcSize, outSize,
                 "HEVC ${if (isHdr) "Main10 HDR10+" else "Main SDR"}$dvNote, 减小 ${saved}%")
         } catch (t: Throwable) {
             outFile.delete()

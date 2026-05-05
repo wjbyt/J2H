@@ -165,30 +165,32 @@ class ConversionForegroundService : Service() {
         appendLog("共发现 ${heicFiles.size} 张 HEIC，开始修复元数据…")
 
         var ok = 0; var skipped = 0; var failed = 0; var totalPatched = 0
+        var mtimeFixed = 0
         for ((idx, f) in heicFiles.withIndex()) {
             if (!currentCoroutineContext().isActive) break
             val name = f.file.name ?: "?"
             _state.value = _state.value.copy(current = name)
             updateNotification("修复 ($idx/${heicFiles.size}): $name", idx, heicFiles.size)
             try {
-                when (val r = com.wjbyt.j2h.heif.HeicMetadataRepair.repair(applicationContext, f.file)) {
+                val r = com.wjbyt.j2h.heif.HeicMetadataRepair.repair(applicationContext, f.file)
+                val byteFix: String = when (r) {
                     is com.wjbyt.j2h.heif.HeicMetadataRepair.Result.Ok -> {
                         ok++; totalPatched += r.patchedItems
-                        appendLog("✓ $name 修复 ${r.patchedItems} 个 item flags")
+                        "已修补 ${r.patchedItems} 个 infe flag"
                     }
                     is com.wjbyt.j2h.heif.HeicMetadataRepair.Result.Skipped -> {
                         skipped++
+                        "container 已合规，无需字节修补"
                     }
                     is com.wjbyt.j2h.heif.HeicMetadataRepair.Result.Failed -> {
                         failed++
-                        appendLog("✗ $name 失败：${r.reason}")
+                        "字节修补失败：${r.reason}"
                     }
                 }
                 // Whether or not byte-flag patching changed anything, push the
                 // HEIC's own EXIF DateTime into file mtime + MediaStore so that
-                // vivo gallery shows the correct shoot time. This is the
-                // user-visible fix even on files that didn't need a byte patch.
-                try {
+                // vivo gallery shows the correct shoot time.
+                val mtimeFix: String = try {
                     val snap = com.wjbyt.j2h.heif.MediaStoreSync.readSourceJpg(
                         applicationContext, f.file
                     )
@@ -196,16 +198,23 @@ class ConversionForegroundService : Service() {
                         val note = com.wjbyt.j2h.heif.MediaStoreSync.apply(
                             applicationContext, f.file.uri, snap
                         )
-                        if (note.isNotBlank()) appendLog("  $name$note")
-                    }
-                } catch (_: Throwable) { /* best-effort */ }
+                        mtimeFixed++
+                        "时间戳已同步至拍摄时间$note"
+                    } else "无 EXIF DateTime 可同步"
+                } catch (e: Throwable) {
+                    "时间戳同步异常：${e.message?.take(40)}"
+                }
+                val tag = if (r is com.wjbyt.j2h.heif.HeicMetadataRepair.Result.Failed) "✗" else "✓"
+                appendLog("$tag $name · $byteFix · $mtimeFix")
             } catch (e: Throwable) {
                 failed++
                 appendLog("✗ $name 异常：${e.javaClass.simpleName} ${e.message}")
             }
             _state.value = _state.value.copy(done = ok, failed = failed, skipped = skipped)
         }
-        appendLog("==== 修复完成：成功 $ok（共改 $totalPatched 个 flag），无需修改 $skipped，失败 $failed ====")
+        appendLog("==== 修复完成：处理 ${heicFiles.size} 张，" +
+                  "字节修补 $ok（共改 $totalPatched 个 flag），无需修补 $skipped，" +
+                  "失败 $failed，时间戳同步 $mtimeFixed ====")
         _state.value = _state.value.copy(running = false, current = "")
     }
 
@@ -299,7 +308,11 @@ class ConversionForegroundService : Service() {
                     )) {
                         is com.wjbyt.j2h.video.VideoTranscoder.Result.Ok -> {
                             done++
-                            appendLog("✓ $tag $name → ${r.outName} ${r.bytesIn / 1024 / 1024}MB→${r.bytesOut / 1024 / 1024}MB · ${r.note}")
+                            // When the output replaces the source in-place
+                            // (same filename), don't print "foo → foo".
+                            val title = if (name == r.outName) name
+                                        else "$name → ${r.outName}"
+                            appendLog("✓ $tag $title ${r.bytesIn / 1024 / 1024}MB→${r.bytesOut / 1024 / 1024}MB · ${r.note}")
                         }
                         is com.wjbyt.j2h.video.VideoTranscoder.Result.Skipped -> {
                             skipped++
