@@ -251,34 +251,167 @@ class HeicConverter(
         parent: DocumentFile, targetName: String,
         srcJpg: DocumentFile, snapshot: MediaStoreSync.Snapshot
     ): Result.Ok? {
-        val out = parent.createFile("image/heic", targetName)
-            ?: return null.also { com.wjbyt.j2h.work.ConversionForegroundService
-                .appendLog("  · 无法创建输出文件") }
-        try {
-            context.contentResolver.openOutputStream(out.uri, "w")?.use { it.write(bytes) }
-                ?: run { out.delete(); return null }
-        } catch (e: Exception) {
-            out.delete()
-            com.wjbyt.j2h.work.ConversionForegroundService.appendLog("  · 写入失败: ${e.message}")
-            return null
-        }
-
-        val decodeErr = verifyDecodable(out)
-        if (decodeErr != null) {
-            out.delete()
+        // Verify bytes decode before writing anywhere — saves a round-trip
+        // through the filesystem on broken outputs.
+        verifyDecodableBytes(bytes)?.let { reason ->
             com.wjbyt.j2h.work.ConversionForegroundService
-                .appendLog("  · $label 输出不可解码（$decodeErr）")
+                .appendLog("  · $label 输出不可解码（$reason）")
             return null
         }
 
-        val metaNote = MediaStoreSync.apply(context, out.uri, snapshot)
-        val outSize = out.length()
+        // Try MediaStore-owned write first — when WE create the row via
+        // ContentResolver.insert(), MediaStore records owner_package_name=
+        // com.wjbyt.j2h, which lets us set DATE_TAKEN / GPS / make / model
+        // at insert time AND have those values stick. The SAF write path
+        // (parent.createFile) gives the row to DocumentsUI; vivo silently
+        // rejects all our updates against DocumentsUI-owned rows AND its
+        // MediaScanner doesn't extract EXIF on the way in.
+        val msResult = tryMediaStoreWrite(bytes, targetName, parent, snapshot)
+        val outUri: android.net.Uri
+        val outDoc: DocumentFile?
+        val mediaPath: String?
+        if (msResult != null) {
+            outUri = msResult.first
+            outDoc = null
+            mediaPath = msResult.second
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · MediaStore 写入成功（我们拥有该行）"
+            )
+        } else {
+            // Fallback: SAF write (legacy, ownership stays with DocumentsUI).
+            val out = parent.createFile("image/heic", targetName)
+                ?: return null.also { com.wjbyt.j2h.work.ConversionForegroundService
+                    .appendLog("  · 无法创建输出文件") }
+            try {
+                context.contentResolver.openOutputStream(out.uri, "w")?.use { it.write(bytes) }
+                    ?: run { out.delete(); return null }
+            } catch (e: Exception) {
+                out.delete()
+                com.wjbyt.j2h.work.ConversionForegroundService
+                    .appendLog("  · 写入失败: ${e.message}")
+                return null
+            }
+            outUri = out.uri
+            outDoc = out
+            mediaPath = null
+        }
+
+        // Bytes were already verified above; no need to re-verify on disk.
+        val metaNote = if (mediaPath != null) {
+            // MediaStore path: snapshot already merged into the row at insert
+            // time; just set mtime so 时间 displays correctly in vivo gallery.
+            snapshot.dateTakenMillis?.let { ts ->
+                if (mediaPath.isNotBlank()) {
+                    try { java.io.File(mediaPath).setLastModified(ts) } catch (_: Exception) {}
+                }
+            }
+            " [meta: ms-insert]"
+        } else {
+            MediaStoreSync.apply(context, outUri, snapshot)
+        }
+        val outSize = outDoc?.length() ?: (mediaPath?.let { java.io.File(it).length() } ?: 0L)
         val srcSize = srcJpg.length()
         if (!srcJpg.delete()) {
             com.wjbyt.j2h.work.ConversionForegroundService
                 .appendLog("  · 已转换但删除原 JPG 失败 — 手动删除")
         }
         return Result.Ok(targetName, srcSize, outSize, "$label$metaNote")
+    }
+
+    /**
+     * Returns (mediaUri, absolutePath) on success, null when MediaStore
+     * insert isn't possible for this destination (e.g. user picked a folder
+     * outside the standard public dirs that MediaStore manages).
+     */
+    private fun tryMediaStoreWrite(
+        bytes: ByteArray, targetName: String, parent: DocumentFile,
+        snap: MediaStoreSync.Snapshot
+    ): Pair<android.net.Uri, String>? {
+        val relPath = relativePathForMediaStore(parent.uri) ?: return null
+        val resolver = context.contentResolver
+        val collection = android.provider.MediaStore.Images.Media
+            .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+
+        // If there's already a file with this name at this path (e.g. user
+        // re-runs conversion), MediaStore will create "$name (1).heic" by
+        // default. With MANAGE_EXTERNAL_STORAGE we can clear the old row
+        // first so the new file lands at the expected name.
+        try {
+            val existSel = "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=? AND " +
+                           "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH}=?"
+            resolver.delete(collection, existSel, arrayOf(targetName, relPath))
+        } catch (_: Exception) {}
+
+        val values = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, targetName)
+            put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/heic")
+            put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, relPath)
+            put(android.provider.MediaStore.Images.Media.IS_PENDING, 1)
+            snap.dateTakenMillis?.let {
+                put(android.provider.MediaStore.Images.Media.DATE_TAKEN, it)
+                put(android.provider.MediaStore.Images.Media.DATE_MODIFIED, it / 1000)
+                put(android.provider.MediaStore.Images.Media.DATE_ADDED, it / 1000)
+            }
+            // Best-effort vendor columns; ignored by AOSP, may stick on vivo.
+            snap.gpsLat?.let { put("latitude", it) }
+            snap.gpsLon?.let { put("longitude", it) }
+        }
+        val uri = try { resolver.insert(collection, values) } catch (e: Exception) {
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · MediaStore.insert 失败: ${e.message?.take(80)}"
+            )
+            null
+        } ?: return null
+
+        // If a file with the same DISPLAY_NAME already existed, MediaStore
+        // returns a URI for it; ensure we're starting from a clean state.
+        try {
+            resolver.openOutputStream(uri, "w")?.use { it.write(bytes) }
+                ?: throw IllegalStateException("openOutputStream returned null")
+        } catch (e: Exception) {
+            try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · MediaStore 写入失败: ${e.message?.take(80)}"
+            )
+            return null
+        }
+
+        // Publish (clear IS_PENDING) so the gallery picks it up.
+        val publishValues = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.Images.Media.IS_PENDING, 0)
+        }
+        try { resolver.update(uri, publishValues, null, null) }
+        catch (e: Exception) {
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · MediaStore 发布失败: ${e.message?.take(60)}"
+            )
+        }
+
+        // Resolve to an absolute path so callers can setLastModified.
+        val absPath = try {
+            resolver.query(uri, arrayOf(android.provider.MediaStore.MediaColumns.DATA),
+                           null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        } catch (_: Exception) { null }
+        // We still consider the write a success even without the path —
+        // the row is created; mtime fix just won't apply.
+        return uri to (absPath ?: "")
+    }
+
+    /** "Download/照片/" from a SAF tree URI for primary external storage. */
+    private fun relativePathForMediaStore(parentUri: android.net.Uri): String? {
+        return try {
+            val docId = try {
+                android.provider.DocumentsContract.getTreeDocumentId(parentUri)
+            } catch (_: Exception) {
+                android.provider.DocumentsContract.getDocumentId(parentUri)
+            }
+            val parts = docId.split(":", limit = 2)
+            if (parts[0] != "primary") return null  // only primary external
+            val rel = parts.getOrNull(1).orEmpty()
+            if (rel.isEmpty()) null else "$rel/"
+        } catch (_: Exception) { null }
     }
 
     private fun encodeViaHeifWriter(bitmap: Bitmap): ByteArray {
@@ -293,6 +426,19 @@ class HeicConverter(
     }
 
     /** Returns null if the file decodes; an error string otherwise. */
+    /** Decode-verify directly from in-memory bytes (no SAF round-trip). */
+    private fun verifyDecodableBytes(bytes: ByteArray): String? {
+        val tmp = File.createTempFile("j2h_verify_", ".heic", context.cacheDir)
+        return try {
+            tmp.writeBytes(bytes)
+            val test = try { android.graphics.BitmapFactory.decodeFile(tmp.absolutePath) }
+                       catch (e: Exception) { return "解码异常: ${e.message}" }
+            if (test == null) return "解码返回空，bitstream 可能损坏"
+            test.recycle()
+            null
+        } finally { tmp.delete() }
+    }
+
     private fun verifyDecodable(heic: DocumentFile): String? {
         val tmp = File.createTempFile("verify_", ".heic", context.cacheDir)
         try {
