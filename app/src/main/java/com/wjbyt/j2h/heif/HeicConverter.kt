@@ -390,6 +390,63 @@ class HeicConverter(
             )
         }
 
+        // Post-publish: try every plausible column name for shoot-time /
+        // GPS / camera identity, one at a time. We OWN the row now, so any
+        // column the schema actually accepts will land. Log per-column
+        // result so the next iteration can lock in the working names.
+        val updateAttempts = mutableListOf<Pair<String, Any>>()
+        snap.dateTakenMillis?.let {
+            updateAttempts += "datetaken" to it
+            updateAttempts += "date_taken" to it
+            updateAttempts += "inferred_date" to it
+            updateAttempts += "datetime_original" to it
+            updateAttempts += "exif_datetime_original" to it
+            updateAttempts += "exif_datetime" to it
+        }
+        snap.gpsLat?.let {
+            updateAttempts += "latitude" to it
+            updateAttempts += "gps_latitude" to it
+            updateAttempts += "exif_gps_latitude" to it
+        }
+        snap.gpsLon?.let {
+            updateAttempts += "longitude" to it
+            updateAttempts += "gps_longitude" to it
+            updateAttempts += "exif_gps_longitude" to it
+        }
+        snap.make?.takeIf { it.isNotBlank() }?.let {
+            updateAttempts += "make" to it
+            updateAttempts += "manufacturer" to it
+            updateAttempts += "exif_make" to it
+            updateAttempts += "camera_make" to it
+        }
+        snap.model?.takeIf { it.isNotBlank() }?.let {
+            updateAttempts += "model" to it
+            updateAttempts += "device" to it
+            updateAttempts += "exif_model" to it
+            updateAttempts += "camera_model" to it
+        }
+        val accepted = mutableListOf<String>()
+        val rejected = mutableListOf<String>()
+        for ((col, v) in updateAttempts) {
+            val cv = android.content.ContentValues().apply {
+                when (v) {
+                    is Long -> put(col, v)
+                    is Double -> put(col, v)
+                    is String -> put(col, v)
+                    else -> put(col, v.toString())
+                }
+            }
+            try {
+                val n = resolver.update(uri, cv, null, null)
+                if (n > 0) accepted += col else rejected += "$col(0)"
+            } catch (e: Exception) {
+                rejected += "$col(${e.message?.take(20)})"
+            }
+        }
+        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+            "  · 列写入: 接受=${accepted.joinToString(",")}; 拒绝=${rejected.joinToString(",")}"
+        )
+
         // Resolve to an absolute path so callers can setLastModified.
         // MediaColumns.DATA is restricted on Android 11+ even for owned
         // files; compute the path deterministically from RELATIVE_PATH +
@@ -451,10 +508,18 @@ class HeicConverter(
                 .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
             // Pick any image NOT owned by us — that's a Samsung-style
             // file that MediaScanner extracted EXIF from natively.
+            // LIMIT inside the orderBy isn't supported on Android 11+;
+            // pass it via a Bundle instead.
             val sel = "owner_package_name IS NULL OR owner_package_name != ?"
             val args = arrayOf(context.packageName)
-            resolver.query(collection, null, sel, args,
-                           "${android.provider.MediaStore.MediaColumns.DATE_MODIFIED} DESC LIMIT 5")
+            val queryArgs = android.os.Bundle().apply {
+                putString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION, sel)
+                putStringArray(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args)
+                putString(android.content.ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
+                    "${android.provider.MediaStore.MediaColumns.DATE_MODIFIED} DESC")
+                putInt(android.content.ContentResolver.QUERY_ARG_LIMIT, 20)
+            }
+            resolver.query(collection, null, queryArgs, null)
                 ?.use { c ->
                     var picked = false
                     while (c.moveToNext()) {
