@@ -308,6 +308,13 @@ class HeicConverter(
             com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                 "  · mtime 设置: ${if (mtimeOk) "ok" else "fail"} (path=$mediaPath)"
             )
+            // Critical test: read OUR just-written HEIC back through Android's
+            // ExifInterface (the same library vivo's gallery likely uses) and
+            // log which tags survived. If make/model/GPS round-trip cleanly,
+            // any failure to display in the gallery is on vivo's side. If
+            // tags don't round-trip, our injector produced something Android's
+            // parser can't read.
+            verifyExifReadback(outUri)
             " [meta: ms-insert]"
         } else {
             MediaStoreSync.apply(context, outUri, snapshot)
@@ -521,22 +528,11 @@ class HeicConverter(
             }
             resolver.query(collection, null, queryArgs, null)
                 ?.use { c ->
-                    var picked = false
-                    while (c.moveToNext()) {
-                        // Has any non-empty geo/make-like column?
-                        var interesting = false
-                        for (i in 0 until c.columnCount) {
-                            val name = c.getColumnName(i).lowercase()
-                            if (name in setOf("latitude", "longitude", "make",
-                                              "manufacturer", "datetaken")) {
-                                val v = try { c.getString(i) } catch (_: Exception) { null }
-                                if (!v.isNullOrBlank() && v != "0" && v != "0.0") {
-                                    interesting = true; break
-                                }
-                            }
-                        }
-                        if (!interesting) continue
-                        picked = true
+                    // Just dump the FIRST few non-our rows verbatim — let
+                    // me eyeball what's actually populated regardless of
+                    // column names we'd guess.
+                    var dumped = 0
+                    while (c.moveToNext() && dumped < 2) {
                         val sb = StringBuilder()
                         for (i in 0 until c.columnCount) {
                             val name = c.getColumnName(i)
@@ -546,12 +542,12 @@ class HeicConverter(
                             }
                         }
                         com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
-                            "  · 别人的行 (供参考): $sb")
-                        break
+                            "  · 别人的行 #${dumped+1}: $sb")
+                        dumped++
                     }
-                    if (!picked) {
+                    if (dumped == 0) {
                         com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
-                            "  · 找不到第三方写入且包含 EXIF 的图像行")
+                            "  · 探针: 没有非本应用的图像行")
                     }
                 }
         } catch (e: Exception) {
@@ -587,6 +583,50 @@ class HeicConverter(
     }
 
     /** Returns null if the file decodes; an error string otherwise. */
+    /**
+     * Read OUR HEIC back through ExifInterface and log key tags. This is
+     * the same library Android's MediaScanner uses to extract EXIF for
+     * MediaStore — and likely what vivo gallery uses to populate its
+     * info panel on demand. If a tag is null here, it'll be missing in
+     * the gallery too.
+     */
+    private fun verifyExifReadback(uri: android.net.Uri) {
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val ex = androidx.exifinterface.media.ExifInterface(input)
+                val parts = mutableListOf<String>()
+                fun add(label: String, tag: String) {
+                    val v = ex.getAttribute(tag)
+                    if (!v.isNullOrBlank()) parts += "$label=${v.take(40)}"
+                }
+                add("Make", androidx.exifinterface.media.ExifInterface.TAG_MAKE)
+                add("Model", androidx.exifinterface.media.ExifInterface.TAG_MODEL)
+                add("DateTime",
+                    androidx.exifinterface.media.ExifInterface.TAG_DATETIME)
+                add("DateTimeOriginal",
+                    androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL)
+                add("FNumber",
+                    androidx.exifinterface.media.ExifInterface.TAG_F_NUMBER)
+                add("ISO",
+                    androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
+                val ll = ex.latLong
+                if (ll != null) parts += "LatLong=${"%.5f".format(ll[0])},${"%.5f".format(ll[1])}"
+                com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                    if (parts.isEmpty())
+                        "  · ExifInterface 回读: 全部为空（解析失败！）"
+                    else
+                        "  · ExifInterface 回读: ${parts.joinToString(", ")}"
+                )
+            } ?: com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · ExifInterface 回读: 无法打开 InputStream"
+            )
+        } catch (e: Exception) {
+            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                "  · ExifInterface 回读异常: ${e.message?.take(80)}"
+            )
+        }
+    }
+
     /** Decode-verify directly from in-memory bytes (no SAF round-trip). */
     private fun verifyDecodableBytes(bytes: ByteArray): String? {
         val tmp = File.createTempFile("j2h_verify_", ".heic", context.cacheDir)
