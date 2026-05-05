@@ -88,42 +88,85 @@ object MediaStoreSync {
             } catch (e: Exception) { parts += "mtime=${e.message?.take(30)}" }
         }
 
-        // 2) MediaScanner: gives us the MediaStore URI; populate the rich
-        // columns there so vendor galleries see make/model/GPS.
+        // 2) MediaScanner → MediaStore. Try a known-good base set first, then
+        // attempt vendor-extension columns one at a time so an unknown column
+        // on one row doesn't kill the whole update. The vivo gallery reads
+        // make/model/GPS from MediaStore (verified via the Samsung HEIC: same
+        // file content, same MediaScanner — and it shows make/model/地点).
         if (snap.dateTakenMillis != null || snap.gpsLat != null ||
             snap.make != null || snap.model != null) {
-            val cv = ContentValues().apply {
+            // Always-safe columns (standard MediaStore schema).
+            val baseCv = ContentValues().apply {
                 snap.dateTakenMillis?.let {
                     put(MediaStore.Images.Media.DATE_TAKEN, it)
                     // Some galleries time-sort on DATE_MODIFIED instead.
                     put(MediaStore.Images.Media.DATE_MODIFIED, it / 1000)
                 }
-                // LATITUDE/LONGITUDE were removed from public API in 29 but
-                // most vendor MediaStores keep them — try anyway, swallow
-                // SQLiteException if the column doesn't exist.
-                snap.gpsLat?.let { put("latitude", it) }
-                snap.gpsLon?.let { put("longitude", it) }
+            }
+            // Best-guess vendor columns. Each gets attempted independently;
+            // we log which ones succeeded so the next iteration knows what
+            // vivo's MediaStore actually accepts.
+            val attempts = mutableListOf<Pair<String, Any>>()
+            snap.gpsLat?.let {
+                attempts += "latitude" to it
+                attempts += "gps_latitude" to it
+            }
+            snap.gpsLon?.let {
+                attempts += "longitude" to it
+                attempts += "gps_longitude" to it
+            }
+            snap.make?.takeIf { it.isNotBlank() }?.let {
+                attempts += "make" to it
+                attempts += "manufacturer" to it
+            }
+            snap.model?.takeIf { it.isNotBlank() }?.let {
+                attempts += "model" to it
+                attempts += "device" to it
             }
             try {
                 MediaScannerConnection.scanFile(
                     context, arrayOf(path), arrayOf("image/heic")
                 ) { _, scannedUri ->
-                    if (scannedUri != null) {
-                        try {
-                            val n = context.contentResolver.update(scannedUri, cv, null, null)
-                            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
-                                "  · MediaStore 更新 $scannedUri → $n 行"
-                            )
-                        } catch (e: Exception) {
-                            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
-                                "  · MediaStore 更新失败: ${e.message?.take(80)}"
-                            )
-                        }
-                    } else {
+                    if (scannedUri == null) {
                         com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                             "  · MediaScanner 扫描完成但未返回 URI（vendor MediaStore 拒绝索引？）"
                         )
+                        return@scanFile
                     }
+                    val cr = context.contentResolver
+                    // Step A: standard columns in one shot.
+                    val baseRows = try {
+                        cr.update(scannedUri, baseCv, null, null)
+                    } catch (e: Exception) {
+                        com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                            "  · MediaStore 基础列更新失败: ${e.message?.take(80)}"
+                        )
+                        0
+                    }
+                    // Step B: vendor columns, one at a time so a single bad
+                    // column doesn't rollback the whole update.
+                    val accepted = mutableListOf<String>()
+                    val rejected = mutableListOf<String>()
+                    for ((col, value) in attempts) {
+                        val cv = ContentValues().apply {
+                            when (value) {
+                                is Double -> put(col, value)
+                                is String -> put(col, value)
+                                is Long   -> put(col, value)
+                                is Int    -> put(col, value)
+                                else -> put(col, value.toString())
+                            }
+                        }
+                        try {
+                            val n = cr.update(scannedUri, cv, null, null)
+                            if (n > 0) accepted += col
+                        } catch (_: Exception) {
+                            rejected += col
+                        }
+                    }
+                    com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                        "  · MediaStore: 基础列 $baseRows 行；vendor 接受=${accepted.joinToString(",")}；拒绝=${rejected.joinToString(",")}"
+                    )
                 }
                 parts += "scan=requested"
             } catch (e: Exception) { parts += "scan=${e.message?.take(30)}" }
