@@ -69,6 +69,16 @@ android {
         }
     }
 
+    // We use MANAGE_EXTERNAL_STORAGE (sideload-only debug app — never on Play
+    // Store). AGP's lint flags it as `ScopedStorage` and on AGP 8.5+ this can
+    // promote to a build error during checkReleaseBuilds. Tell lint to back
+    // off — we still get the warnings in the IDE.
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
+        disable += setOf("ScopedStorage")
+    }
+
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")

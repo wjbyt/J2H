@@ -79,22 +79,12 @@ object MediaStoreSync {
 
         // 1) File mtime → shot time. This is the single most-impactful change
         // for vivo's gallery: their info panel displays this value as 时间.
+        // Requires MANAGE_EXTERNAL_STORAGE on Android 11+ for SAF-written
+        // outputs (because we don't own the inode otherwise).
         snap.dateTakenMillis?.let { ts ->
             try {
                 val ok = java.io.File(path).setLastModified(ts)
                 parts += if (ok) "mtime=ok" else "mtime=denied"
-                // Some kernels reject setLastModified silently; try Os.utimes
-                // as a backup if the boolean said denied.
-                if (!ok) {
-                    try {
-                        android.system.Os.utimes(path,
-                            doubleArrayOf((ts / 1000).toDouble(),
-                                          (ts / 1000).toDouble()))
-                        parts += "utimes=ok"
-                    } catch (e: Exception) {
-                        parts += "utimes=${e.message?.take(30)}"
-                    }
-                }
             } catch (e: Exception) { parts += "mtime=${e.message?.take(30)}" }
         }
 
