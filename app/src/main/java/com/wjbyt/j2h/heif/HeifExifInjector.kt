@@ -336,7 +336,12 @@ object HeifExifInjector {
      * inter_free_size). File total size is unchanged.
      */
     private fun combineMdatAndTrailing(data: ByteArray): ByteArray {
-        val top = parseTopLevel(data)
+        // Use the lenient parser — once we add the JPEG-style "Exif\0\0"
+        // marker to the trailing blob, its first 4 bytes parse as box-size=6
+        // which the strict parser rejects. We need to walk only the WELL-
+        // FORMED top-level boxes (ftyp/meta/free/mdat) and treat the rest
+        // of the file as opaque trailing data.
+        val top = parseTopLevelLenient(data)
         val ftyp = top.firstOrNull { it.type == "ftyp" } ?: return data
         val meta = top.firstOrNull { it.type == "meta" } ?: return data
         val mdat = top.firstOrNull { it.type == "mdat" } ?: return data
@@ -345,9 +350,13 @@ object HeifExifInjector {
         val betweenMetaAndMdat = top.filter {
             it.offset > meta.offset && it.offset < mdat.offset
         }
-        val afterMdat = top.filter { it.offset >= mdat.offset + mdat.size }
-        val trailingSize = afterMdat.sumOf { it.size }.toInt()
-        if (trailingSize == 0) {
+        // Trailing bytes = everything from end of mdat to end of file. The
+        // lenient parser stops at the malformed Exif marker, so we infer
+        // from file-size delta rather than trying to enumerate trailing
+        // boxes.
+        val mdatEndOffset = (mdat.offset + mdat.size).toInt()
+        val trailingSize = data.size - mdatEndOffset
+        if (trailingSize <= 0) {
             // No trailing blobs — fall back to plain reorder.
             return reorderMdatBeforeMeta(data)
         }
@@ -376,9 +385,7 @@ object HeifExifInjector {
         out.write(data, mdat.offset.toInt() + 8,
                   mdat.size.toInt() - 8)
         // trailing data (Exif + thumb), contiguous, becomes part of mdat
-        for (b in afterMdat) {
-            out.write(data, b.offset.toInt(), b.size.toInt())
-        }
+        out.write(data, mdatEndOffset, trailingSize)
         // patched meta
         out.write(patchedMeta)
         // free (or other boxes that originally lived between meta and mdat)
@@ -404,7 +411,9 @@ object HeifExifInjector {
      * decide whether to extract EXIF.
      */
     private fun normalizeHvcCProfile(data: ByteArray): ByteArray {
-        val top = parseTopLevel(data)
+        // Lenient: file may have a trailing Exif blob whose marker bytes
+        // look like a malformed box header.
+        val top = parseTopLevelLenient(data)
         val meta = top.firstOrNull { it.type == "meta" } ?: return data
         val subStart = meta.payloadOffset + 4
         val subEnd = meta.endOffset
@@ -462,7 +471,8 @@ object HeifExifInjector {
      * meta box stays the same size and we can swap regions wholesale.
      */
     private fun reorderMdatBeforeMeta(data: ByteArray): ByteArray {
-        val top = parseTopLevel(data)
+        // Lenient: may run on an already-injected file with trailing blob.
+        val top = parseTopLevelLenient(data)
         val ftyp = top.firstOrNull { it.type == "ftyp" } ?: return data
         val meta = top.firstOrNull { it.type == "meta" } ?: return data
         val mdat = top.firstOrNull { it.type == "mdat" } ?: return data
@@ -668,6 +678,37 @@ object HeifExifInjector {
 
     private fun parseTopLevel(data: ByteArray): List<RawBox> =
         parseBoxList(data, 0L, data.size.toLong())
+
+    /**
+     * Like [parseTopLevel] but stops gracefully on malformed box headers
+     * instead of throwing — for use by post-process stages that walk a
+     * file containing our trailing Exif blob (whose first 4 bytes look
+     * like a degenerate box of size 6 thanks to the JPEG-style "Exif\0\0"
+     * prefix). Anything past the first malformed header is the caller's
+     * to handle as opaque trailing data.
+     */
+    private fun parseTopLevelLenient(data: ByteArray): List<RawBox> {
+        val out = mutableListOf<RawBox>()
+        var p = 0L
+        val end = data.size.toLong()
+        while (p + 8 <= end) {
+            val size32 = readU32(data, p)
+            val type = readType(data, p + 4)
+            val (size, headerSize) = when (size32) {
+                1L -> {
+                    if (p + 16 > end) break
+                    val largeSize = readU64(data, p + 8)
+                    largeSize to 16
+                }
+                0L -> (end - p) to 8
+                else -> size32 to 8
+            }
+            if (size < headerSize || p + size > end) break
+            out += RawBox(type, p, size, headerSize)
+            p += size
+        }
+        return out
+    }
 
     private fun parseBoxList(data: ByteArray, start: Long, end: Long): List<RawBox> {
         val out = mutableListOf<RawBox>()
