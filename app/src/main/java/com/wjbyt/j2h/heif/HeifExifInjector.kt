@@ -52,8 +52,11 @@ object HeifExifInjector {
 
         val baseNewId = ((parsedIinf.entries.maxOfOrNull { it.itemId } ?: 0) + 1)
             .coerceAtLeast(primaryItemId + 1)
-        val newItemId = baseNewId
-        val thumbItemId = if (thumb != null) baseNewId + 1 else 0
+        // Samsung lays out item IDs as: tiles 1..48, grid 49, thumb 50, Exif
+        // 51 — so the Exif item's ID is the HIGHEST, with thumbnail just
+        // before it. Match that ordering so iinf lists go thumb-then-Exif.
+        val thumbItemId = if (thumb != null) baseNewId else 0
+        val newItemId = if (thumb != null) baseNewId + 1 else baseNewId
 
         val ilocBox = subBoxes.firstOrNull { it.type == "iloc" }
             ?: error("No iloc box")
@@ -125,16 +128,13 @@ object HeifExifInjector {
 
         // ----- Build new sub-box bytes (sizes are deterministic) -----
         val newIinfEntries = parsedIinf.entries.toMutableList()
-        // The Exif metadata item is NOT hidden per HEIF spec — the `hidden`
-        // bit (flags & 1) only applies to image items that shouldn't be
-        // presented (grid tiles etc.). Some galleries (vivo) skip lookup of
-        // metadata items that are marked hidden, which is the most plausible
-        // remaining gap between our output and Samsung's accepted HEICs.
-        newIinfEntries += IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "", flags = 0)
+        // Samsung's accepted-by-vivo HEIC has the Exif item HIDDEN (flag=1)
+        // and the thumbnail listed BEFORE the Exif entry in iinf. Match that
+        // exactly — earlier guesses to the contrary did not move the needle.
         if (thumb != null) {
-            // Thumbnail image item — hide it from primary presentation.
             newIinfEntries += IinfEntry(itemId = thumbItemId, itemType = "hvc1", itemName = "", flags = 1)
         }
+        newIinfEntries += IinfEntry(itemId = newItemId, itemType = "Exif", itemName = "", flags = 1)
         val newIinfBytes = buildIinf(parsedIinf.version, newIinfEntries)
 
         val newRefs = iref.refs.toMutableList()
@@ -253,12 +253,138 @@ object HeifExifInjector {
             )
         }
 
-        return assemble(
+        val assembled = assemble(
             heicData, topBoxes, metaIdx, metaBox, subBoxes,
             newIinfBytes, newIrefBytes, irefBox, newIlocBytes,
             newIprpBytes,
             newMetaSize, exifBlock, thumbBytes
         )
+        return reorderMdatBeforeMeta(assembled)
+    }
+
+    /**
+     * Post-process to put `mdat` before `meta` (Samsung-style top-level
+     * order). vivo's MediaScanner is the most plausible reader that demands
+     * this — files written by HeifWriter ship with `meta` first, and vivo's
+     * gallery does not extract make/model/GPS from such files even though
+     * they are spec-compliant and read fine on macOS.
+     *
+     * The mechanics: any iloc extent with construction_method==0 that
+     * currently points into the OLD mdat region needs its absolute
+     * extent_offset shifted by `−(meta_size + free_size_between_meta_and_mdat)`
+     * so it points to the same bytes at their NEW location near the start of
+     * the file. iloc field widths are preserved (we never grow), so the
+     * meta box stays the same size and we can swap regions wholesale.
+     */
+    private fun reorderMdatBeforeMeta(data: ByteArray): ByteArray {
+        val top = parseTopLevel(data)
+        val ftyp = top.firstOrNull { it.type == "ftyp" } ?: return data
+        val meta = top.firstOrNull { it.type == "meta" } ?: return data
+        val mdat = top.firstOrNull { it.type == "mdat" } ?: return data
+        // Already in target order? Nothing to do.
+        if (mdat.offset < meta.offset) return data
+
+        // Boxes between meta and mdat (typically a free pad). They move with
+        // meta — i.e., they end up between meta and the trailing region.
+        val betweenMetaAndMdat = top.filter {
+            it.offset > meta.offset && it.offset < mdat.offset
+        }
+        // Boxes after mdat (our trailing Exif/thumb appended after mdat).
+        // They keep their absolute offsets.
+        val afterMdat = top.filter { it.offset >= mdat.offset + mdat.size }
+
+        // How much do iloc tile offsets need to shift?
+        val newMdatOffset = (ftyp.offset + ftyp.size).toInt()
+        val mdatShift = newMdatOffset - mdat.offset.toInt()  // negative
+
+        val patchedMetaBytes = patchMetaIlocForMdatShift(
+            data, meta, mdat, mdatShift
+        ) ?: return data
+
+        // ----- Stitch -----
+        val out = ByteArrayOutputStream(data.size)
+        // ftyp
+        out.write(data, ftyp.offset.toInt(), ftyp.size.toInt())
+        // mdat (unchanged bytes, new position)
+        out.write(data, mdat.offset.toInt(), mdat.size.toInt())
+        // patched meta
+        out.write(patchedMetaBytes)
+        // boxes that originally lived between meta and mdat (e.g., free pad)
+        for (b in betweenMetaAndMdat) {
+            out.write(data, b.offset.toInt(), b.size.toInt())
+        }
+        // trailing region (Exif/thumb), unchanged
+        for (b in afterMdat) {
+            out.write(data, b.offset.toInt(), b.size.toInt())
+        }
+        // Sanity: total size unchanged.
+        check(out.size() == data.size) {
+            "reorder produced wrong size: ${out.size()} vs ${data.size}"
+        }
+        return out.toByteArray()
+    }
+
+    /**
+     * Returns a fresh meta box (header + payload) where every iloc
+     * extent_offset that pointed into the old mdat range has been shifted
+     * by [mdatShift]. Returns null if the iloc field widths cannot
+     * accommodate the shifted values without growing (caller should fall
+     * back to the un-reordered output).
+     */
+    private fun patchMetaIlocForMdatShift(
+        data: ByteArray, meta: RawBox, mdat: RawBox, mdatShift: Int
+    ): ByteArray? {
+        val subStart = meta.payloadOffset + 4  // after meta version+flags
+        val subEnd = meta.endOffset
+        val subs = parseBoxList(data, subStart, subEnd)
+        val ilocBox = subs.firstOrNull { it.type == "iloc" } ?: return null
+        val iloc = parseIloc(data, ilocBox)
+
+        val mdatStart = mdat.offset
+        val mdatEnd = mdat.offset + mdat.size
+        // Patch entries whose extents land in the old mdat range.
+        val newEntries = iloc.entries.map { e ->
+            if (e.constructionMethod != 0) return@map e
+            // Either base_offset is non-zero (and its target is the start of
+            // a contiguous run inside mdat) or each extent has its own
+            // absolute offset.
+            if (iloc.baseOffsetSize > 0 && e.baseOffset in mdatStart until mdatEnd) {
+                e.copy(baseOffset = e.baseOffset + mdatShift)
+            } else {
+                val newExtents = e.extents.map { x ->
+                    val abs = (if (iloc.baseOffsetSize > 0) e.baseOffset else 0L) +
+                                x.extentOffset
+                    if (abs in mdatStart until mdatEnd) {
+                        x.copy(extentOffset = x.extentOffset + mdatShift)
+                    } else x
+                }
+                e.copy(extents = newExtents)
+            }
+        }
+        val newIloc = iloc.copy(entries = newEntries)
+        val newIlocBytes = buildIloc(newIloc)
+        if (newIlocBytes.size != ilocBox.size.toInt()) {
+            // Field widths grew (shouldn't, since we only DECREASE values),
+            // but bail safely if it ever happens.
+            return null
+        }
+
+        // Splice the new iloc bytes into the meta box.
+        val out = ByteArray(meta.size.toInt())
+        // 1. meta header + version+flags
+        System.arraycopy(data, meta.offset.toInt(), out, 0, (subStart - meta.offset).toInt())
+        // 2. sub-boxes, replacing iloc
+        var writePos = (subStart - meta.offset).toInt()
+        for (sub in subs) {
+            if (sub.type == "iloc") {
+                System.arraycopy(newIlocBytes, 0, out, writePos, newIlocBytes.size)
+                writePos += newIlocBytes.size
+            } else {
+                System.arraycopy(data, sub.offset.toInt(), out, writePos, sub.size.toInt())
+                writePos += sub.size.toInt()
+            }
+        }
+        return out
     }
 
     private fun newMetaSizeWithGrowth(base: Int, growth: Int) = base + growth
