@@ -44,27 +44,54 @@ object HeifExifInjector {
 
         val pitmBox = subBoxes.firstOrNull { it.type == "pitm" }
             ?: error("No pitm box")
-        val primaryItemId = parsePitm(heicData, pitmBox)
+        val rawPrimaryItemId = parsePitm(heicData, pitmBox)
 
         val iinfBox = subBoxes.firstOrNull { it.type == "iinf" }
             ?: error("No iinf box")
-        val parsedIinf = parseIinf(heicData, iinfBox)
-
-        val baseNewId = ((parsedIinf.entries.maxOfOrNull { it.itemId } ?: 0) + 1)
-            .coerceAtLeast(primaryItemId + 1)
-        // Samsung lays out item IDs as: tiles 1..48, grid 49, thumb 50, Exif
-        // 51 — so the Exif item's ID is the HIGHEST, with thumbnail just
-        // before it. Match that ordering so iinf lists go thumb-then-Exif.
-        val thumbItemId = if (thumb != null) baseNewId else 0
-        val newItemId = if (thumb != null) baseNewId + 1 else baseNewId
+        val rawParsedIinf = parseIinf(heicData, iinfBox)
 
         val ilocBox = subBoxes.firstOrNull { it.type == "iloc" }
             ?: error("No iloc box")
-        val iloc = parseIloc(heicData, ilocBox)
+        val rawIloc = parseIloc(heicData, ilocBox)
 
         val irefBox = subBoxes.firstOrNull { it.type == "iref" }
-        val iref = irefBox?.let { parseIref(heicData, it) }
+        val rawIref = irefBox?.let { parseIref(heicData, it) }
             ?: IrefData(version = 0, refs = mutableListOf())
+
+        // ----- Samsung-style item ID renumbering -----
+        // HeifWriter assigns large IDs (10000+); Samsung uses 1..N. The first
+        // infe entry's bytes are the ONLY remaining structural diff between
+        // our output and Samsung's after the meta/top-level reorder, and is
+        // the most plausible reason vivo's MediaScanner skips our EXIF.
+        // Map: tiles (in dimg.to) → 1..N, grid → N+1, other items → N+2..M
+        val dimgRef = rawIref.refs.firstOrNull { it.refType == "dimg" }
+        val tileIds = dimgRef?.toItemIds ?: emptyList()
+        val idMap = mutableMapOf<Int, Int>()
+        var nextRemap = 1
+        for (id in tileIds) idMap[id] = nextRemap++
+        if (rawPrimaryItemId !in idMap) idMap[rawPrimaryItemId] = nextRemap++
+        for (e in rawParsedIinf.entries) {
+            if (e.itemId !in idMap) idMap[e.itemId] = nextRemap++
+        }
+        // Helper: remap a single item id (returns identity if not in map).
+        fun rm(id: Int): Int = idMap[id] ?: id
+        val primaryItemId = rm(rawPrimaryItemId)
+        val parsedIinf = rawParsedIinf.copy(
+            entries = rawParsedIinf.entries.map { it.copy(itemId = rm(it.itemId)) }
+        )
+        val iloc = rawIloc.copy(
+            entries = rawIloc.entries.map { it.copy(itemId = rm(it.itemId)) }
+        )
+        val iref = rawIref.copy(refs = rawIref.refs.map {
+            it.copy(
+                fromItemId = rm(it.fromItemId),
+                toItemIds = it.toItemIds.map { id -> rm(id) }
+            )
+        }.toMutableList())
+
+        val baseNewId = nextRemap.coerceAtLeast(primaryItemId + 1)
+        val thumbItemId = if (thumb != null) baseNewId else 0
+        val newItemId = if (thumb != null) baseNewId + 1 else baseNewId
 
         // ----- iprp augmentation -----
         // Add (a) irot box associated with the primary image, and (b) when a
@@ -76,7 +103,11 @@ object HeifExifInjector {
         val newIprpBytes: ByteArray? = iprpBox?.let { ipBox ->
             val parsed = parseIprp(heicData, ipBox)
             val children = parsed.ipcoChildren.toMutableList()
-            val ipma = parsed.ipmaEntries.toMutableList()
+            // Remap ipma item ids alongside iinf/iloc/iref so all references
+            // line up after the Samsung-style renumbering above.
+            val ipma = parsed.ipmaEntries.map {
+                it.copy(itemId = rm(it.itemId))
+            }.toMutableList()
 
             // Grid irot
             val hasIrot = children.any {
@@ -124,6 +155,14 @@ object HeifExifInjector {
             if (changed)
                 buildIprp(children, parsed.ipmaVersion, parsed.ipmaFlags, ipma)
             else null
+        }
+
+        // ----- Build new pitm with remapped primary id (size invariant) -----
+        val pitmVer = parsePitmVersion(heicData, pitmBox)
+        val newPitmBytes = buildPitm(pitmVer, primaryItemId)
+        require(newPitmBytes.size == pitmBox.size.toInt()) {
+            "pitm size changed unexpectedly after id remap: " +
+            "${pitmBox.size} -> ${newPitmBytes.size}"
         }
 
         // ----- Build new sub-box bytes (sizes are deterministic) -----
@@ -244,22 +283,32 @@ object HeifExifInjector {
             val rebuilt = finalIlocAdjusted.copy(entries = reShifted + reEntries)
             val rebuiltBytes = buildIloc(rebuilt)
             require(rebuiltBytes.size == newIlocBytes.size) { "iloc size unstable after upgrade" }
-            return assemble(
+            return reorderMdatBeforeMeta(assemble(
                 heicData, topBoxes, metaIdx, metaBox, subBoxes,
                 newIinfBytes, newIrefBytes, irefBox, rebuiltBytes,
-                newIprpBytes,
+                newIprpBytes, newPitmBytes,
                 newMetaSizeWithGrowth(newMetaSize, growth),
                 exifBlock, thumbBytes
-            )
+            ))
         }
 
-        val assembled = assemble(
+        return reorderMdatBeforeMeta(assemble(
             heicData, topBoxes, metaIdx, metaBox, subBoxes,
             newIinfBytes, newIrefBytes, irefBox, newIlocBytes,
-            newIprpBytes,
+            newIprpBytes, newPitmBytes,
             newMetaSize, exifBlock, thumbBytes
-        )
-        return reorderMdatBeforeMeta(assembled)
+        ))
+    }
+
+    private fun parsePitmVersion(data: ByteArray, box: RawBox): Int =
+        data[box.payloadOffset.toInt()].toInt() and 0xFF
+
+    private fun buildPitm(version: Int, primaryItemId: Int): ByteArray {
+        val body = ByteArrayOutputStream()
+        body.write(byteArrayOf(version.toByte(), 0, 0, 0)) // version + flags
+        if (version == 0) writeU16(body, primaryItemId)
+        else writeU32(body, primaryItemId.toLong())
+        return wrapBox("pitm", body.toByteArray())
     }
 
     /**
@@ -415,6 +464,7 @@ object HeifExifInjector {
         oldIref: RawBox?,
         newIlocBytes: ByteArray,
         newIprpBytes: ByteArray?,
+        newPitmBytes: ByteArray,
         newMetaSize: Int,
         exifBlock: ByteArray,
         thumbBytes: ByteArray
@@ -425,6 +475,7 @@ object HeifExifInjector {
         var irefWritten = false
         for (sub in subBoxes) {
             when (sub.type) {
+                "pitm" -> newMetaPayload.write(newPitmBytes)
                 "iinf" -> newMetaPayload.write(newIinfBytes)
                 "iref" -> { newMetaPayload.write(newIrefBytes); irefWritten = true }
                 "iloc" -> newMetaPayload.write(newIlocBytes)
