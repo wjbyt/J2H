@@ -31,24 +31,40 @@ object MediaStoreSync {
         val gpsLat: Double? = null,
         val gpsLon: Double? = null,
         val make: String? = null,
-        val model: String? = null
+        val model: String? = null,
+        val datetimeStr: String? = null,      // raw "yyyy:MM:dd HH:mm:ss" — kept verbatim
+        val exposureTime: Double? = null,     // seconds
+        val fNumber: Double? = null,
+        val iso: Int? = null,
+        val focalLength: Double? = null,      // mm
+        val orientation: Int? = null
     )
 
     fun readSourceJpg(context: Context, jpg: DocumentFile): Snapshot {
         return try {
             context.contentResolver.openInputStream(jpg.uri)?.use { input ->
                 val exif = ExifInterface(input)
-                val dt = parseExifDate(
-                    exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                        ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
-                )
+                val dtStr = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                val dt = parseExifDate(dtStr)
                 val ll = exif.latLong // returns DoubleArray? of [lat, lon] or null
                 Snapshot(
                     dateTakenMillis = dt,
                     gpsLat = ll?.getOrNull(0),
                     gpsLon = ll?.getOrNull(1),
                     make = exif.getAttribute(ExifInterface.TAG_MAKE),
-                    model = exif.getAttribute(ExifInterface.TAG_MODEL)
+                    model = exif.getAttribute(ExifInterface.TAG_MODEL),
+                    datetimeStr = dtStr,
+                    exposureTime = exif.getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, 0.0)
+                        .takeIf { it > 0 },
+                    fNumber = exif.getAttributeDouble(ExifInterface.TAG_F_NUMBER, 0.0)
+                        .takeIf { it > 0 },
+                    iso = exif.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 0)
+                        .takeIf { it > 0 },
+                    focalLength = exif.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0)
+                        .takeIf { it > 0 },
+                    orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, 0)
+                        .takeIf { it > 0 }
                 )
             }
         } catch (_: Exception) { null } ?: Snapshot()

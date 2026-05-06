@@ -205,14 +205,34 @@ class HeicConverter(
 
                     // Diagnostics: file size + first 32 bytes (so we can see if it's a
                     // valid HEIF starting with 'ftyp' or something else entirely).
-                    val bytes = tmp.readBytes()
-                    val head = bytes.take(32).joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
-                    val ascii = bytes.take(32).joinToString("") {
+                    val rawBytes = tmp.readBytes()
+                    val head = rawBytes.take(32).joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+                    val ascii = rawBytes.take(32).joinToString("") {
                         val c = it.toInt() and 0xFF
                         if (c in 0x20..0x7E) c.toChar().toString() else "."
                     }
                     com.wjbyt.j2h.work.ConversionForegroundService
-                        .appendLog("  · 10bit 输出 ${bytes.size}B, 头部: $head ($ascii)")
+                        .appendLog("  · 10bit 输出 ${rawBytes.size}B, 头部: $head ($ascii)")
+
+                    // Inject the same EXIF item the JPG path produces — the
+                    // DNG's TIFF tags get rebuilt from the snapshot we already
+                    // pulled (Make / Model / DateTime / GPS / camera params).
+                    // Without this, vivo gallery shows nothing in 参数 / 地点
+                    // for DNG-converted HEICs.
+                    val tiff = com.wjbyt.j2h.exif.ExifTiffBuilder.build(snapshot)
+                    val bytes = if (tiff != null) {
+                        try {
+                            HeifExifInjector.inject(rawBytes, tiff, thumb = null)
+                        } catch (e: Exception) {
+                            com.wjbyt.j2h.work.ConversionForegroundService
+                                .appendLog("  · DNG EXIF 注入异常（保留无 EXIF 输出）: ${e.message}")
+                            rawBytes
+                        }
+                    } else rawBytes
+                    if (tiff != null) {
+                        com.wjbyt.j2h.work.ConversionForegroundService
+                            .appendLog("  · DNG EXIF 注入完成: ${tiff.size}B TIFF")
+                    }
 
                     val ok = writeAndVerify(
                         "MediaCodec-Main10", bytes, parent, targetName, jpg, snapshot
