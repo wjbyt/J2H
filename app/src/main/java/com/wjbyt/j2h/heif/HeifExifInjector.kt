@@ -1169,4 +1169,142 @@ object HeifExifInjector {
 
         return wrapBox("iprp", ipcoBox + ipmaBox)
     }
+
+    // ---------------------------------------------------------------
+    // In-place repair: add the JPEG-style "Exif\0\0" marker to the
+    // existing Exif item of an already-converted HEIC, without re-encoding
+    // the image. Old builds wrote the Exif item as just [4-byte prefix=0]
+    // [TIFF...]; Android ExifInterface needs [4-byte prefix=6][Exif\0\0]
+    // [TIFF...]. We read the old item bytes, prepend the marker, append
+    // the new bytes inside the existing mdat (extending it by 6 + bytes
+    // for prefix change), and patch iloc to point to the new location.
+    // The orphaned old bytes are left in mdat — small storage waste, but
+    // structurally still valid and avoids having to relocate every other
+    // iloc entry.
+    // ---------------------------------------------------------------
+
+    sealed interface RepairResult {
+        data class Patched(val bytes: ByteArray, val growthBytes: Int) : RepairResult
+        data object AlreadyOk : RepairResult
+        data class CannotRepair(val reason: String) : RepairResult
+    }
+
+    fun repairExifMarker(heicBytes: ByteArray): RepairResult {
+        val top = parseTopLevelLenient(heicBytes)
+        val mdat = top.firstOrNull { it.type == "mdat" }
+            ?: return RepairResult.CannotRepair("no mdat box")
+        val meta = top.firstOrNull { it.type == "meta" }
+            ?: return RepairResult.CannotRepair("no meta box")
+
+        val subStart = meta.payloadOffset + 4
+        val subEnd = meta.endOffset
+        val subs = parseBoxList(heicBytes, subStart, subEnd)
+        val iinfBox = subs.firstOrNull { it.type == "iinf" }
+            ?: return RepairResult.CannotRepair("no iinf")
+        val ilocBox = subs.firstOrNull { it.type == "iloc" }
+            ?: return RepairResult.CannotRepair("no iloc")
+
+        val parsedIinf = parseIinf(heicBytes, iinfBox)
+        val exifEntry = parsedIinf.entries.firstOrNull { it.itemType == "Exif" }
+            ?: return RepairResult.CannotRepair("no Exif item")
+
+        val iloc = parseIloc(heicBytes, ilocBox)
+        val exifIlocEntry = iloc.entries.firstOrNull { it.itemId == exifEntry.itemId }
+            ?: return RepairResult.CannotRepair("no iloc entry for Exif item")
+        val exifExtent = exifIlocEntry.extents.firstOrNull()
+            ?: return RepairResult.CannotRepair("Exif iloc has no extent")
+        if (exifIlocEntry.constructionMethod != 0) {
+            return RepairResult.CannotRepair("Exif construction_method != 0")
+        }
+
+        val absStart = (if (iloc.baseOffsetSize > 0) exifIlocEntry.baseOffset else 0L) +
+                        exifExtent.extentOffset
+        val absEnd = absStart + exifExtent.extentLength
+        if (absEnd > heicBytes.size) {
+            return RepairResult.CannotRepair("Exif extent overflows file")
+        }
+        val itemBytes = heicBytes.copyOfRange(absStart.toInt(), absEnd.toInt())
+
+        // Already has the marker?
+        if (itemBytes.size >= 10 &&
+            itemBytes[0] == 0.toByte() && itemBytes[1] == 0.toByte() &&
+            itemBytes[2] == 0.toByte() && itemBytes[3] == 6.toByte() &&
+            itemBytes[4] == 0x45.toByte() && itemBytes[5] == 0x78.toByte() &&
+            itemBytes[6] == 0x69.toByte() && itemBytes[7] == 0x66.toByte() &&
+            itemBytes[8] == 0.toByte() && itemBytes[9] == 0.toByte()) {
+            return RepairResult.AlreadyOk
+        }
+
+        // Extract raw TIFF (skip whatever prefix exists).
+        if (itemBytes.size < 8) return RepairResult.CannotRepair("Exif item too short")
+        val prefix = readU32(itemBytes, 0L)
+        val tiffStart = (4 + prefix).toInt()
+        if (tiffStart >= itemBytes.size || tiffStart < 0) {
+            return RepairResult.CannotRepair("bad prefix=$prefix")
+        }
+        val tiff = itemBytes.copyOfRange(tiffStart, itemBytes.size)
+
+        // Build new item bytes with proper marker.
+        val newItem = ByteArray(4 + 6 + tiff.size)
+        newItem[3] = 6
+        newItem[4] = 0x45; newItem[5] = 0x78; newItem[6] = 0x69; newItem[7] = 0x66
+        // bytes 8 and 9 are already 0
+        System.arraycopy(tiff, 0, newItem, 10, tiff.size)
+
+        // The new bytes go at the END of the existing mdat (extending it).
+        // Other iloc entries inside mdat keep their offsets — they're at the
+        // same absolute positions. The old Exif item bytes are orphaned (no
+        // iloc points to them anymore), but stay in the file.
+        val insertPos = (mdat.offset + mdat.size).toInt()
+        val newExifAbsOffset = insertPos.toLong()
+        val newExifLength = newItem.size.toLong()
+
+        // Patch iloc: Exif extent now points to new location, length = new size.
+        val newIlocEntries = iloc.entries.map { e ->
+            if (e.itemId == exifEntry.itemId) {
+                e.copy(
+                    baseOffset = 0L,
+                    extents = listOf(IlocExtent(0L, newExifAbsOffset, newExifLength))
+                )
+            } else e
+        }
+        // Make sure offset/length field widths can hold the new values.
+        val upgraded = upgradeIlocFieldSizes(
+            iloc.copy(entries = newIlocEntries),
+            extraOffset = newExifAbsOffset,
+            extraLength = newExifLength
+        )
+        val newIlocBytes = buildIloc(upgraded)
+        if (newIlocBytes.size != ilocBox.size.toInt()) {
+            // Field widths grew; we'd have to re-layout meta. Out of scope for
+            // the in-place fast path. Caller can fall back to full re-encode.
+            return RepairResult.CannotRepair(
+                "iloc field widths need to grow (${ilocBox.size} -> ${newIlocBytes.size})"
+            )
+        }
+
+        // Build output: original bytes through end of old mdat content, then
+        // the new Exif item bytes, then everything that came after old mdat
+        // (meta, free, etc.). Update mdat header size.
+        val out = ByteArray(heicBytes.size + newItem.size)
+        System.arraycopy(heicBytes, 0, out, 0, insertPos)
+        System.arraycopy(newItem, 0, out, insertPos, newItem.size)
+        System.arraycopy(heicBytes, insertPos, out, insertPos + newItem.size,
+                         heicBytes.size - insertPos)
+
+        // Update mdat box size (4 bytes BE at mdat.offset).
+        val newMdatSize = (mdat.size + newItem.size).toInt()
+        val mdatSizePos = mdat.offset.toInt()
+        out[mdatSizePos]     = ((newMdatSize ushr 24) and 0xFF).toByte()
+        out[mdatSizePos + 1] = ((newMdatSize ushr 16) and 0xFF).toByte()
+        out[mdatSizePos + 2] = ((newMdatSize ushr 8) and 0xFF).toByte()
+        out[mdatSizePos + 3] = (newMdatSize and 0xFF).toByte()
+
+        // Splice patched iloc back. The iloc box itself moved forward by
+        // newItem.size bytes (it lives in meta, which is after mdat).
+        val newIlocPos = ilocBox.offset.toInt() + newItem.size
+        System.arraycopy(newIlocBytes, 0, out, newIlocPos, newIlocBytes.size)
+
+        return RepairResult.Patched(out, newItem.size)
+    }
 }

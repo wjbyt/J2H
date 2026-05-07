@@ -31,17 +31,35 @@ object HeicMetadataRepair {
         } catch (e: Exception) { return Result.Failed("读取失败: ${e.message}") }
             ?: return Result.Failed("无法打开")
 
-        val (patched, count) = try { patchInfeFlags(bytes) }
+        // Phase 1: byte-flag patch (legacy, idempotent).
+        val (afterFlags, flagCount) = try { patchInfeFlags(bytes) }
             catch (e: Exception) { return Result.Failed("解析失败: ${e.message}") }
 
-        if (count == 0) return Result.Skipped("无需修复")
+        // Phase 2: add JPEG-style "Exif\0\0" marker to the existing Exif item
+        // if it's missing. This is what makes ExifInterface (and vivo gallery)
+        // actually read EXIF tags from old HEICs we converted before the fix.
+        val markerResult = try {
+            HeifExifInjector.repairExifMarker(afterFlags)
+        } catch (e: Exception) {
+            return Result.Failed("Exif marker 修复异常: ${e.message?.take(80)}")
+        }
+        val (final, markerPatched) = when (markerResult) {
+            is HeifExifInjector.RepairResult.Patched -> markerResult.bytes to true
+            HeifExifInjector.RepairResult.AlreadyOk  -> afterFlags to false
+            is HeifExifInjector.RepairResult.CannotRepair -> {
+                // Couldn't byte-patch — keep flag fixes only.
+                afterFlags to false
+            }
+        }
+
+        if (flagCount == 0 && !markerPatched) return Result.Skipped("无需修复")
 
         try {
-            context.contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(patched) }
+            context.contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(final) }
                 ?: return Result.Failed("无法写回")
         } catch (e: Exception) { return Result.Failed("写回失败: ${e.message}") }
 
-        return Result.Ok(count)
+        return Result.Ok(flagCount + (if (markerPatched) 1 else 0))
     }
 
     /**
