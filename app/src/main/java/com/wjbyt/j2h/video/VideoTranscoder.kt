@@ -424,9 +424,26 @@ object VideoTranscoder {
             }
             // Mirror source mtime onto the converted file so vivo gallery's
             // "时间" panel shows the original shoot time, not the conversion
-            // time.
+            // time. Also inject ©mak / ©mod into moov/udta so the gallery's
+            // "拍摄设备" line gets populated — Android's MediaMuxer doesn't
+            // expose these atoms, so we patch the closed file.
             safPath(outFile.uri)?.let { p ->
-                try { java.io.File(p).setLastModified(srcMtime) } catch (_: Exception) {}
+                val f = java.io.File(p)
+                try { f.setLastModified(srcMtime) } catch (_: Exception) {}
+                val injected = try {
+                    Mp4MetadataInjector.inject(
+                        f,
+                        make = android.os.Build.MANUFACTURER,
+                        model = android.os.Build.MODEL
+                    )
+                } catch (_: Exception) { false }
+                if (injected) {
+                    com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                        "  · 已注入 ©mak/©mod: ${android.os.Build.MANUFACTURER} / ${android.os.Build.MODEL}"
+                    )
+                    // mtime gets bumped by the rewrite — restore it.
+                    try { f.setLastModified(srcMtime) } catch (_: Exception) {}
+                }
             }
             val saved = if (srcSize > 0) (100 - outSize * 100 / srcSize) else 0L
             val dvNote = if (isDolbyVisionInput) "（DV→HDR10+）" else ""
