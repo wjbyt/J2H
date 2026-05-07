@@ -49,7 +49,10 @@ class HeicConverter(
         com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
             "  源 EXIF: DateTime=${snapshot.dateTakenMillis}, " +
             "GPS=${if (snapshot.gpsLat != null) "%.6f,%.6f".format(snapshot.gpsLat, snapshot.gpsLon ?: 0.0) else "null"}, " +
-            "Make=${snapshot.make ?: "null"}, Model=${snapshot.model ?: "null"}"
+            "Make=${snapshot.make ?: "null"}, Model=${snapshot.model ?: "null"}, " +
+            "ExpTime=${snapshot.exposureTime}, FNumber=${snapshot.fNumber}, " +
+            "ISO=${snapshot.iso}, FocalLen=${snapshot.focalLength}, " +
+            "Orient=${snapshot.orientation}"
         )
 
         val srcBytes = try {
@@ -162,14 +165,15 @@ class HeicConverter(
             } catch (e: Exception) { null }
             bitmap.recycle()
             if (converted == null) return Result.Failed("解码后无法获得 RGBA_F16 位图")
-            return finishDng(converted, jpg, parent, targetName, snapshot, existing)
+            return finishDng(converted, jpg, parent, targetName, snapshot, existing, srcBytes)
         }
-        return finishDng(bitmap, jpg, parent, targetName, snapshot, existing)
+        return finishDng(bitmap, jpg, parent, targetName, snapshot, existing, srcBytes)
     }
 
     private fun finishDng(
         bitmap: Bitmap, jpg: DocumentFile, parent: DocumentFile, targetName: String,
-        snapshot: MediaStoreSync.Snapshot, existing: DocumentFile?
+        snapshot: MediaStoreSync.Snapshot, existing: DocumentFile?,
+        srcDngBytes: ByteArray
     ): Result {
         try {
             val w = bitmap.width and 1.inv()
@@ -214,12 +218,26 @@ class HeicConverter(
                     com.wjbyt.j2h.work.ConversionForegroundService
                         .appendLog("  · 10bit 输出 ${rawBytes.size}B, 头部: $head ($ascii)")
 
-                    // Inject the same EXIF item the JPG path produces — the
-                    // DNG's TIFF tags get rebuilt from the snapshot we already
-                    // pulled (Make / Model / DateTime / GPS / camera params).
-                    // Without this, vivo gallery shows nothing in 参数 / 地点
-                    // for DNG-converted HEICs.
-                    val tiff = com.wjbyt.j2h.exif.ExifTiffBuilder.build(snapshot)
+                    // Inject the EXIF the same way the JPG path does. For DNG
+                    // we have two sources for the TIFF blob:
+                    //   1. Direct parse of the DNG bytes — DNG IS TIFF, so we
+                    //      can copy IFD0 metadata + ExifIFD + GPSIFD verbatim.
+                    //      This carries the FULL camera-params widget data
+                    //      (focal / f-number / shutter / ISO / EV) that
+                    //      ExifInterface often skips on DNG.
+                    //   2. Snapshot-rebuild via ExifTiffBuilder — what
+                    //      ExifInterface managed to surface, fallback only.
+                    val tiff = com.wjbyt.j2h.exif.DngExifExtractor.extractTiff(srcDngBytes)
+                        ?.also {
+                            com.wjbyt.j2h.work.ConversionForegroundService
+                                .appendLog("  · DngExifExtractor: 直读 DNG TIFF (${it.size}B)")
+                        }
+                        ?: com.wjbyt.j2h.exif.ExifTiffBuilder.build(snapshot)
+                        ?.also {
+                            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                                "  · DngExifExtractor 失败，回退 ExifTiffBuilder (${it.size}B)"
+                            )
+                        }
                     val bytes = if (tiff != null) {
                         try {
                             HeifExifInjector.inject(rawBytes, tiff, thumb = null)
