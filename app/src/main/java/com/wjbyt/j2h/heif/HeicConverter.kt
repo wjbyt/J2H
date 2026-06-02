@@ -26,7 +26,14 @@ import java.io.File
  */
 class HeicConverter(
     private val context: Context,
-    private val quality: Int = 95
+    private val quality: Int = 95,
+    /**
+     * Given a source file's mtime, returns a borrowed (lat, lon) for inputs
+     * that carry no GPS of their own (notably DNG — vivo records location in
+     * its private DB, not the file). Supplied by the batch layer, which
+     * collects GPS from same-session siblings (videos / JPGs).
+     */
+    private val gpsFallback: ((Long?) -> Pair<Double, Double>?)? = null
 ) {
     sealed interface Result {
         data class Ok(val outName: String, val bytesIn: Long, val bytesOut: Long, val encoder: String) : Result
@@ -227,12 +234,31 @@ class HeicConverter(
                     //      ExifInterface often skips on DNG.
                     //   2. Snapshot-rebuild via ExifTiffBuilder — what
                     //      ExifInterface managed to surface, fallback only.
-                    val tiff = com.wjbyt.j2h.exif.DngExifExtractor.extractTiff(srcDngBytes)
+
+                    // Resolve a GPS fix for the output. The DNG itself has none
+                    // (vivo stores location in its private DB, not the file), so
+                    // probe MediaStore for the original's location; failing that
+                    // borrow a same-batch sibling's GPS via gpsFallback.
+                    val resolvedGps: Pair<Double, Double>? =
+                        if (snapshot.gpsLat != null && snapshot.gpsLon != null)
+                            snapshot.gpsLat to snapshot.gpsLon
+                        else probeSourceLocation(jpg)?.also {
+                            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                                "  · 探测到源位置(MediaStore): %.5f, %.5f".format(it.first, it.second))
+                        } ?: gpsFallback?.invoke(jpg.lastModified())?.also {
+                            com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
+                                "  · 借用同批 GPS: %.5f, %.5f".format(it.first, it.second))
+                        }
+                    val effSnap = if (resolvedGps != null && snapshot.gpsLat == null)
+                        snapshot.copy(gpsLat = resolvedGps.first, gpsLon = resolvedGps.second)
+                        else snapshot
+
+                    val tiff = com.wjbyt.j2h.exif.DngExifExtractor.extractTiff(srcDngBytes, resolvedGps)
                         ?.also {
                             com.wjbyt.j2h.work.ConversionForegroundService
                                 .appendLog("  · DngExifExtractor: 直读 DNG TIFF (${it.size}B)")
                         }
-                        ?: com.wjbyt.j2h.exif.ExifTiffBuilder.build(snapshot)
+                        ?: com.wjbyt.j2h.exif.ExifTiffBuilder.build(effSnap)
                         ?.also {
                             com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                                 "  · DngExifExtractor 失败，回退 ExifTiffBuilder (${it.size}B)"
@@ -253,7 +279,7 @@ class HeicConverter(
                     }
 
                     val ok = writeAndVerify(
-                        "MediaCodec-Main10", bytes, parent, targetName, jpg, snapshot
+                        "MediaCodec-Main10", bytes, parent, targetName, jpg, effSnap
                     )
                     if (ok != null) return ok
 
@@ -364,6 +390,38 @@ class HeicConverter(
                 .appendLog("  · 已转换但删除原 JPG 失败 — 手动删除")
         }
         return Result.Ok(targetName, srcSize, outSize, "$label$metaNote")
+    }
+
+    /**
+     * Best-effort probe for a source file's location via MediaStore +
+     * ACCESS_MEDIA_LOCATION + setRequireOriginal. vivo keeps DNG location in
+     * its private DB (not the file), so this typically returns null and we fall
+     * back to borrowing; but when the source IS a MediaStore image whose
+     * original carries real GPS EXIF, this recovers the exact fix.
+     */
+    private fun probeSourceLocation(src: DocumentFile): Pair<Double, Double>? {
+        val name = src.name ?: return null
+        return try {
+            val resolver = context.contentResolver
+            val coll = android.provider.MediaStore.Images.Media
+                .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            resolver.query(
+                coll, arrayOf(android.provider.MediaStore.Images.Media._ID),
+                "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=?", arrayOf(name), null
+            )?.use { c ->
+                if (!c.moveToFirst()) return@use null
+                val id = c.getLong(0)
+                val uri = android.content.ContentUris.withAppendedId(coll, id)
+                val orig = android.provider.MediaStore.setRequireOriginal(uri)
+                resolver.openInputStream(orig)?.use { ins ->
+                    val exif = androidx.exifinterface.media.ExifInterface(ins)
+                    val ll = FloatArray(2)
+                    if (exif.getLatLong(ll) && !(ll[0] == 0f && ll[1] == 0f))
+                        ll[0].toDouble() to ll[1].toDouble()
+                    else null
+                }
+            }
+        } catch (_: Exception) { null }
     }
 
     /**

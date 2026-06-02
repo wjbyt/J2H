@@ -222,6 +222,62 @@ class ConversionForegroundService : Service() {
         _state.value = _state.value.copy(running = false, current = "")
     }
 
+    private data class GpsPoint(val time: Long, val lat: Double, val lon: Double)
+
+    /**
+     * Scan a batch's sources for any GPS fix. Videos carry it in the MP4
+     * location atom; JPG/HEIC in EXIF. DNG usually has none. Keyed by file
+     * mtime so DNGs can borrow the closest-in-time sibling's location.
+     */
+    private fun collectBatchGps(
+        files: List<androidx.documentfile.provider.DocumentFile>
+    ): List<GpsPoint> {
+        val pts = mutableListOf<GpsPoint>()
+        for (f in files) {
+            val n = (f.name ?: "").lowercase()
+            try {
+                when {
+                    n.endsWith(".mp4") || n.endsWith(".mov") -> {
+                        val mmr = android.media.MediaMetadataRetriever()
+                        try {
+                            mmr.setDataSource(applicationContext, f.uri)
+                            parseIso6709(mmr.extractMetadata(
+                                android.media.MediaMetadataRetriever.METADATA_KEY_LOCATION
+                            ))?.let { pts += GpsPoint(f.lastModified(), it.first, it.second) }
+                        } finally { mmr.release() }
+                    }
+                    n.endsWith(".jpg") || n.endsWith(".jpeg") ||
+                    n.endsWith(".heic") || n.endsWith(".dng") -> {
+                        applicationContext.contentResolver.openInputStream(f.uri)?.use { ins ->
+                            val exif = androidx.exifinterface.media.ExifInterface(ins)
+                            val ll = FloatArray(2)
+                            if (exif.getLatLong(ll) && !(ll[0] == 0f && ll[1] == 0f)) {
+                                pts += GpsPoint(f.lastModified(), ll[0].toDouble(), ll[1].toDouble())
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+        return pts
+    }
+
+    private fun nearestGps(pts: List<GpsPoint>, time: Long?): Pair<Double, Double>? {
+        if (pts.isEmpty()) return null
+        val best = if (time == null || time <= 0L) pts.first()
+                   else pts.minByOrNull { kotlin.math.abs(it.time - time) }!!
+        return best.lat to best.lon
+    }
+
+    /** ISO 6709 "+dd.dddd+ddd.dddd[+aa]/" → (lat, lon). */
+    private fun parseIso6709(loc: String?): Pair<Double, Double>? {
+        if (loc.isNullOrEmpty()) return null
+        val m = Regex("([+\\-]\\d+\\.?\\d*)([+\\-]\\d+\\.?\\d*)").find(loc) ?: return null
+        val lat = m.groupValues[1].toDoubleOrNull() ?: return null
+        val lon = m.groupValues[2].toDoubleOrNull() ?: return null
+        return lat to lon
+    }
+
     private fun startWork() {
         if (job?.isActive == true) return
         goForeground("准备开始…")
@@ -302,7 +358,17 @@ class ConversionForegroundService : Service() {
         if (!com.wjbyt.j2h.heif.TenBitEncoder.isAvailable()) {
             appendLog("⚠ 10-bit native lib 不可用，DNG 会失败")
         }
-        val converter = HeicConverter(applicationContext, quality = quality)
+        // Collect GPS from same-batch siblings (videos / JPGs carry it in-file;
+        // DNG doesn't — vivo keeps DNG location in its private DB). DNG → HEIC
+        // borrows the nearest-in-time fix so the gallery shows a location.
+        val batchGps = collectBatchGps(toConvert.map { it.file })
+        if (batchGps.isNotEmpty()) {
+            appendLog("批量定位：收集到 ${batchGps.size} 个 GPS 点，将就近补给无定位的 DNG")
+        }
+        val converter = HeicConverter(
+            applicationContext, quality = quality,
+            gpsFallback = { t -> nearestGps(batchGps, t) }
+        )
         var done = 0; var failed = 0; var skipped = 0
         for ((idx, f) in toConvert.withIndex()) {
             if (!currentCoroutineContext().isActive) break

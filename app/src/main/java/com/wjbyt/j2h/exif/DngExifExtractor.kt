@@ -53,7 +53,44 @@ object DngExifExtractor {
         0xA40A, 0xA40C, 0xA420, 0xA430, 0xA431, 0xA432, 0xA433, 0xA434, 0xA435
     )
 
-    fun extractTiff(dng: ByteArray): ByteArray? {
+    /**
+     * Synthesize a GPS IFD from a decimal (lat, lon). vivo's DNG carries no
+     * GPS at all (the camera records location in its own DB, not the file), so
+     * the DNG → HEIC path passes a location borrowed from a same-batch sibling
+     * (or probed from MediaStore) here. Produces the standard EXIF GPS IFD:
+     * GPSVersionID / LatRef / Latitude(deg,min,sec) / LonRef / Longitude.
+     */
+    private fun buildGpsIfd(lat: Double, lon: Double): List<Entry> = listOf(
+        Entry(0x0000, TYPE_BYTE, 4, packInline(byteArrayOf(2, 3, 0, 0)), null),
+        Entry(0x0001, TYPE_ASCII, 2,
+            packInline((if (lat >= 0) "N" else "S").toByteArray(Charsets.US_ASCII) + byteArrayOf(0)), null),
+        Entry(0x0002, TYPE_RATIONAL, 3, 0L, gpsRational3(kotlin.math.abs(lat))),
+        Entry(0x0003, TYPE_ASCII, 2,
+            packInline((if (lon >= 0) "E" else "W").toByteArray(Charsets.US_ASCII) + byteArrayOf(0)), null),
+        Entry(0x0004, TYPE_RATIONAL, 3, 0L, gpsRational3(kotlin.math.abs(lon)))
+    )
+
+    /** Left-aligned BE pack of up to 4 bytes into a value-or-offset word. */
+    private fun packInline(bytes: ByteArray): Long {
+        val b = (bytes + ByteArray(4)).copyOf(4)
+        return ((b[0].toLong() and 0xFF) shl 24) or ((b[1].toLong() and 0xFF) shl 16) or
+               ((b[2].toLong() and 0xFF) shl 8) or (b[3].toLong() and 0xFF)
+    }
+
+    /** deg/1, min/1, (sec*10000)/10000 as 24 bytes big-endian. */
+    private fun gpsRational3(value: Double): ByteArray {
+        val deg = value.toInt()
+        val minTotal = (value - deg) * 60.0
+        val min = minTotal.toInt()
+        val sec = (minTotal - min) * 60.0
+        return ByteBuffer.allocate(24).order(ByteOrder.BIG_ENDIAN)
+            .putInt(deg).putInt(1)
+            .putInt(min).putInt(1)
+            .putInt((sec * 10000).toInt()).putInt(10000)
+            .array()
+    }
+
+    fun extractTiff(dng: ByteArray, fallbackGps: Pair<Double, Double>? = null): ByteArray? {
         if (dng.size < 16) return null
         val le = when {
             dng[0] == 'M'.code.toByte() && dng[1] == 'M'.code.toByte() -> false
@@ -79,7 +116,15 @@ object DngExifExtractor {
         val exifOff = ifd0.firstOrNull { it.tag == 0x8769 }?.valueOrOffset?.toInt()
         val gpsOff = ifd0.firstOrNull { it.tag == 0x8825 }?.valueOrOffset?.toInt()
         val realExif = exifOff?.let { parseIfd(dng, it, le) } ?: emptyList()
-        val gpsIfd = gpsOff?.let { parseIfd(dng, it, le) } ?: emptyList()
+        // GPS: prefer a real GPS IFD; if the DNG has none (vivo keeps location
+        // in its private DB, not the file), synthesize one from a supplied
+        // fallback location (borrowed from a same-batch sibling / probed).
+        val gpsFromDng = gpsOff?.let { parseIfd(dng, it, le) } ?: emptyList()
+        val gpsIfd: List<Entry> = when {
+            gpsFromDng.isNotEmpty() -> gpsFromDng
+            fallbackGps != null -> buildGpsIfd(fallbackGps.first, fallbackGps.second)
+            else -> emptyList()
+        }
 
         // IFD0: TIFF-domain whitelist only (raw/strip/DNG-specific tags dropped).
         val keptIfd0 = ifd0.filter { it.tag in IFD0_KEEP }.toMutableList()
