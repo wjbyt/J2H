@@ -35,6 +35,24 @@ object DngExifExtractor {
         0x8298   // Copyright
     )
 
+    /**
+     * EXIF-private tags that belong in the ExifIFD. vivo's DNG (TIFF/EP style)
+     * stores these loose in IFD0 with no 0x8769 pointer; we relocate them into
+     * a synthesized ExifIFD so the output matches the standard JPEG-EXIF layout
+     * vivo's gallery reads for the camera-params widget (光圈/快门/ISO/焦距/EV).
+     * MakerNote (0x927C) is deliberately excluded — its internal offsets break
+     * once relocated.
+     */
+    private val EXIF_KEEP = setOf(
+        0x829A, 0x829D, 0x8822, 0x8824, 0x8827, 0x8828, 0x8830, 0x8831, 0x8832,
+        0x8833, 0x8834, 0x8835, 0x9000, 0x9003, 0x9004, 0x9010, 0x9011, 0x9012,
+        0x9201, 0x9202, 0x9203, 0x9204, 0x9205, 0x9206, 0x9207, 0x9208, 0x9209,
+        0x920A, 0x9290, 0x9291, 0x9292, 0xA000, 0xA001, 0xA002, 0xA003, 0xA20B,
+        0xA20E, 0xA20F, 0xA210, 0xA214, 0xA215, 0xA217, 0xA300, 0xA301, 0xA302,
+        0xA401, 0xA402, 0xA403, 0xA404, 0xA405, 0xA406, 0xA407, 0xA408, 0xA409,
+        0xA40A, 0xA40C, 0xA420, 0xA430, 0xA431, 0xA432, 0xA433, 0xA434, 0xA435
+    )
+
     fun extractTiff(dng: ByteArray): ByteArray? {
         if (dng.size < 16) return null
         val le = when {
@@ -48,20 +66,46 @@ object DngExifExtractor {
         if (ifd0Off < 8 || ifd0Off + 2 > dng.size) return null
 
         val ifd0 = parseIfd(dng, ifd0Off, le) ?: return null
+
+        // vivo (and most TIFF/EP DNGs) keep the EXIF camera-param tags
+        // (ExposureTime / FNumber / ISO / FocalLength / DateTimeOriginal …)
+        // DIRECTLY in IFD0 with NO 0x8769 ExifIFD pointer. Other cameras may
+        // also carry a real ExifIFD. We therefore:
+        //   • keep TIFF-domain tags (Make/Model/DateTime/Orientation/…) in IFD0,
+        //   • gather EXIF-domain tags from BOTH a real ExifIFD and the ones
+        //     sitting loose in IFD0, and re-emit them in a synthesized ExifIFD
+        //     behind a fresh 0x8769 pointer — the exact layout the JPG path
+        //     produces and that vivo reads for the camera-params widget.
         val exifOff = ifd0.firstOrNull { it.tag == 0x8769 }?.valueOrOffset?.toInt()
         val gpsOff = ifd0.firstOrNull { it.tag == 0x8825 }?.valueOrOffset?.toInt()
-
-        val exifIfd = exifOff?.let { parseIfd(dng, it, le) } ?: emptyList()
+        val realExif = exifOff?.let { parseIfd(dng, it, le) } ?: emptyList()
         val gpsIfd = gpsOff?.let { parseIfd(dng, it, le) } ?: emptyList()
 
-        // Filter IFD0 to keep tags + pointers (we'll re-emit pointers ourselves).
+        // IFD0: TIFF-domain whitelist only (raw/strip/DNG-specific tags dropped).
         val keptIfd0 = ifd0.filter { it.tag in IFD0_KEEP }.toMutableList()
+
+        // ExifIFD: union of a real ExifIFD (authoritative, listed first so it
+        // wins on dedup) + EXIF tags loose in IFD0. MakerNote dropped — its
+        // internal offsets would dangle after relocation.
+        val exifIfd = (realExif + ifd0.filter { it.tag in EXIF_KEEP })
+            .filter { it.tag != 0x927C }
+            .distinctBy { it.tag }
+            .toMutableList()
+        // EXIF mandates an ExifVersion; synthesize "0230" if the source lacked one.
+        if (exifIfd.none { it.tag == 0x9000 }) {
+            val ver = (0x30L shl 24) or (0x32L shl 16) or (0x33L shl 8) or 0x30L // "0230"
+            exifIfd += Entry(0x9000, TYPE_UNDEFINED, 4, ver, null)
+        }
+        exifIfd.sortBy { it.tag }
+
         if (exifIfd.isNotEmpty()) keptIfd0 += Entry(
             0x8769, TYPE_LONG, 1, 0L, null, isPointer = true, pointerKey = "exif"
         )
         if (gpsIfd.isNotEmpty()) keptIfd0 += Entry(
             0x8825, TYPE_LONG, 1, 0L, null, isPointer = true, pointerKey = "gps"
         )
+        // TIFF requires IFD entries in ascending tag order.
+        keptIfd0.sortBy { it.tag }
 
         if (keptIfd0.isEmpty() && exifIfd.isEmpty() && gpsIfd.isEmpty()) return null
 
