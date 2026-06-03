@@ -430,16 +430,20 @@ object VideoTranscoder {
             safPath(outFile.uri)?.let { p ->
                 val f = java.io.File(p)
                 try { f.setLastModified(srcMtime) } catch (_: Exception) {}
+                val mdl = Mp4MetadataInjector.marketModel()
+                // Source shoot time → MP4 epoch (secs since 1904-01-01 UTC).
+                val creationMp4 = srcMtime / 1000L + 2082844800L
                 val injected = try {
                     Mp4MetadataInjector.inject(
                         f,
                         make = android.os.Build.MANUFACTURER,
-                        model = android.os.Build.MODEL
+                        model = mdl,
+                        creationMp4Time = creationMp4
                     )
                 } catch (_: Exception) { false }
                 if (injected) {
                     com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
-                        "  · 已注入 ©mak/©mod: ${android.os.Build.MANUFACTURER} / ${android.os.Build.MODEL}"
+                        "  · 已注入 ©mak/©mod(QT) + 拍摄时间: ${android.os.Build.MANUFACTURER} / $mdl"
                     )
                     // mtime gets bumped by the rewrite — restore it.
                     try { f.setLastModified(srcMtime) } catch (_: Exception) {}

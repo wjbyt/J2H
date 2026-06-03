@@ -23,17 +23,25 @@ import java.io.RandomAccessFile
  */
 object Mp4MetadataInjector {
 
-    /** Returns true when something was written, false on no-op or failure. */
+    /**
+     * Returns true when something was written, false on no-op or failure.
+     *
+     * @param creationMp4Time when non-null, the source's shoot time as an MP4
+     *   timestamp (seconds since 1904-01-01 UTC = unixSeconds + 2082844800).
+     *   Patched into mvhd + every tkhd so the gallery's "时间" shows the shoot
+     *   time, not the encode time MediaMuxer stamps.
+     */
     fun inject(
         file: File,
         make: String?,
-        model: String?
+        model: String?,
+        creationMp4Time: Long? = null
     ): Boolean {
-        if (make.isNullOrBlank() && model.isNullOrBlank()) return false
+        if (make.isNullOrBlank() && model.isNullOrBlank() && creationMp4Time == null) return false
         if (!file.exists() || file.length() < 16) return false
 
         return try {
-            RandomAccessFile(file, "rw").use { raf -> doInject(raf, make, model) }
+            RandomAccessFile(file, "rw").use { raf -> doInject(raf, make, model, creationMp4Time) }
         } catch (_: Exception) {
             false
         }
@@ -42,7 +50,8 @@ object Mp4MetadataInjector {
     private fun doInject(
         raf: RandomAccessFile,
         make: String?,
-        model: String?
+        model: String?,
+        creationMp4Time: Long?
     ): Boolean {
         val fileLen = raf.length()
         val moov = findTopLevelBox(raf, "moov", fileLen) ?: return false
@@ -58,11 +67,24 @@ object Mp4MetadataInjector {
         val moovBytes = ByteArray(moov.size.toInt())
         raf.readFully(moovBytes)
 
-        // Build the iTunes-style atoms we want to add.
+        // Patch mvhd/tkhd shoot time in place (size-preserving) before any
+        // udta resize, so the patched bytes survive the splice below.
+        creationMp4Time?.let { patchCreationTimes(moovBytes, it) }
+
+        // Build the device atoms in QuickTime udta text format — [len][lang]
+        // [utf8] — matching the ©xyz that MediaMuxer.setLocation writes. The
+        // iTunes 'data' sub-atom format breaks vivo's udta parse (it then drops
+        // resolution + location entirely), so we must NOT use it here.
         val atoms = mutableListOf<ByteArray>()
-        if (!make.isNullOrBlank())  atoms += buildAppleAtom("©mak", make)
-        if (!model.isNullOrBlank()) atoms += buildAppleAtom("©mod", model)
-        if (atoms.isEmpty()) return false
+        if (!make.isNullOrBlank())  atoms += buildQtAtom("©mak", make)
+        if (!model.isNullOrBlank()) atoms += buildQtAtom("©mod", model)
+
+        // Nothing to add to udta — but we may have patched times; write back.
+        if (atoms.isEmpty()) {
+            raf.seek(moov.offset)
+            raf.write(moovBytes)
+            return creationMp4Time != null
+        }
         val addSize = atoms.sumOf { it.size }
 
         // Find udta inside moov (offset relative to moov start).
@@ -162,33 +184,98 @@ object Mp4MetadataInjector {
     // ----- atom builder -----
 
     /**
-     * Build an iTunes-style "©XXX" atom containing a single UTF-8 string.
-     * Layout:
-     *   [outer size 4][outer type 4]
-     *     [data size 4]['data' 4][version+flags 4][locale 4][utf8 string]
-     *
-     * `version+flags` of 0x00000001 means "UTF-8 text".
+     * Build a QuickTime-style "©XXX" udta text atom:
+     *   [outer size 4][©type 4][text length 2][language 2][utf8 text]
+     * This matches the ©xyz atom MediaMuxer.setLocation writes, so vivo parses
+     * the whole udta consistently. Language 0x15C7 mirrors that ©xyz.
      */
-    private fun buildAppleAtom(typeStr: String, value: String): ByteArray {
+    private fun buildQtAtom(typeStr: String, value: String): ByteArray {
         require(typeStr.length == 4)
         val payload = value.toByteArray(Charsets.UTF_8)
-        val dataSize = 16 + payload.size      // 8 hdr + 4 ver/flags + 4 locale + payload
-        val outerSize = 8 + dataSize          // 8 hdr + data atom
+        val outerSize = 8 + 4 + payload.size   // hdr(8) + [len:2][lang:2] + text
         val out = ByteArray(outerSize)
-        // outer
         writeBE32(out, 0, outerSize)
         out[4] = typeStr[0].code.toByte()  // 0xA9 byte for ©
         out[5] = typeStr[1].code.toByte()
         out[6] = typeStr[2].code.toByte()
         out[7] = typeStr[3].code.toByte()
-        // data atom
-        writeBE32(out, 8, dataSize)
-        out[12] = 'd'.code.toByte(); out[13] = 'a'.code.toByte()
-        out[14] = 't'.code.toByte(); out[15] = 'a'.code.toByte()
-        writeBE32(out, 16, 1)  // version=0, flags=1 (UTF-8 text)
-        writeBE32(out, 20, 0)  // locale = 0
-        System.arraycopy(payload, 0, out, 24, payload.size)
+        out[8]  = ((payload.size ushr 8) and 0xFF).toByte()  // text length
+        out[9]  = (payload.size and 0xFF).toByte()
+        out[10] = 0x15.toByte()             // language (same as ©xyz)
+        out[11] = 0xC7.toByte()
+        System.arraycopy(payload, 0, out, 12, payload.size)
         return out
+    }
+
+    // ----- creation-time patching -----
+
+    /** Walk moov → mvhd + every trak/tkhd, overwrite creation+modification time. */
+    private fun patchCreationTimes(moov: ByteArray, mp4Time: Long) {
+        var p = 8
+        while (p + 8 <= moov.size) {
+            val sz = childSize(moov, p, moov.size) ?: break
+            when (String(moov, p + 4, 4, Charsets.US_ASCII)) {
+                "mvhd" -> patchBoxTime(moov, p, mp4Time)
+                "trak" -> {
+                    var q = p + 8
+                    val tend = p + sz
+                    while (q + 8 <= tend) {
+                        val z = childSize(moov, q, tend) ?: break
+                        if (String(moov, q + 4, 4, Charsets.US_ASCII) == "tkhd")
+                            patchBoxTime(moov, q, mp4Time)
+                        q += z
+                    }
+                }
+            }
+            p += sz
+        }
+    }
+
+    /** mvhd/tkhd layout: [size 4][type 4][version 1][flags 3][creation][modification]… */
+    private fun patchBoxTime(moov: ByteArray, boxOff: Int, mp4Time: Long) {
+        if (boxOff + 12 > moov.size) return
+        val ver = moov[boxOff + 8].toInt() and 0xFF
+        if (ver == 1) {
+            if (boxOff + 28 > moov.size) return
+            writeBE64(moov, boxOff + 12, mp4Time)
+            writeBE64(moov, boxOff + 20, mp4Time)
+        } else {
+            if (boxOff + 20 > moov.size) return
+            writeBE32(moov, boxOff + 12, mp4Time.toInt())
+            writeBE32(moov, boxOff + 16, mp4Time.toInt())
+        }
+    }
+
+    private fun childSize(buf: ByteArray, p: Int, end: Int): Int? {
+        if (p + 8 > end) return null
+        val s = readBE32(buf, p).toLong() and 0xFFFFFFFFL
+        val sz = when (s) {
+            0L -> (end - p).toLong()
+            1L -> if (p + 16 <= end) readBE64(buf, p + 8) else return null
+            else -> s
+        }
+        if (sz < 8 || p + sz > end) return null
+        return sz.toInt()
+    }
+
+    /**
+     * vivo's marketing model name (e.g. "vivo X200 Ultra") via system property,
+     * falling back to [android.os.Build.MODEL]. Mirrors HeicConverter's logic
+     * so video device strings match the JPG/DNG path.
+     */
+    fun marketModel(): String {
+        for (key in listOf(
+            "ro.vivo.market.name", "ro.vivo.product.marketname",
+            "ro.product.marketname", "ro.config.marketing_name",
+            "ro.product.model.display"
+        )) {
+            try {
+                val c = Class.forName("android.os.SystemProperties")
+                val v = c.getMethod("get", String::class.java).invoke(null, key) as? String
+                if (!v.isNullOrBlank() && !v.equals(android.os.Build.MODEL, true)) return v
+            } catch (_: Throwable) {}
+        }
+        return android.os.Build.MODEL
     }
 
     // ----- byte helpers -----
@@ -210,5 +297,9 @@ object Mp4MetadataInjector {
         b[off + 1] = ((v ushr 16) and 0xFF).toByte()
         b[off + 2] = ((v ushr 8) and 0xFF).toByte()
         b[off + 3] = (v and 0xFF).toByte()
+    }
+
+    private fun writeBE64(b: ByteArray, off: Int, v: Long) {
+        for (i in 0 until 8) b[off + i] = ((v ushr ((7 - i) * 8)) and 0xFF).toByte()
     }
 }
