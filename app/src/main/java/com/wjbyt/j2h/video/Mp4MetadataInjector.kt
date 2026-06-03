@@ -126,7 +126,18 @@ object Mp4MetadataInjector {
         // and rewrite — no offset tables in mdat to fix up.
         raf.seek(moov.offset)
         raf.write(newMoov)
-        raf.setLength(moov.offset + newMoov.size)
+        var end = moov.offset + newMoov.size
+
+        // Append vivo's proprietary `uuid` box (magic "vivoMediaExtInfo") after
+        // moov. vivo's gallery reads "拍摄设备" from its JSON `takenmodel` field
+        // — NOT from udta ©mak/©mod — so this is what populates the device line.
+        if (!model.isNullOrBlank()) {
+            val uuidBox = buildVivoUuidBox(model)
+            raf.seek(end)
+            raf.write(uuidBox)
+            end += uuidBox.size
+        }
+        raf.setLength(end)
         return true
     }
 
@@ -204,6 +215,30 @@ object Mp4MetadataInjector {
         out[10] = 0x15.toByte()             // language (same as ©xyz)
         out[11] = 0xC7.toByte()
         System.arraycopy(payload, 0, out, 12, payload.size)
+        return out
+    }
+
+    /**
+     * Build vivo's proprietary `uuid` box that its gallery reads "拍摄设备" from.
+     * Layout (mirrors a native vivo camera video):
+     *   [size 4]["uuid" 4]["vivoMediaExtInfo" 16]["vivo" + JSON]
+     * The displayed device comes from the JSON's `com.android.camera.takenmodel`.
+     */
+    private fun buildVivoUuidBox(model: String): ByteArray {
+        val magic = "vivoMediaExtInfo".toByteArray(Charsets.US_ASCII)  // exactly 16 bytes
+        val safe = model.replace("\\", "").replace("\"", "")
+        val json = "vivo{" +
+            "\"com.android.camera.takenmodel\":\"$safe\"," +
+            "\"com.android.camera.moduleid\":\"video\"," +
+            "\"com.android.camera.camerafacing\":\"0\"}"
+        val payload = json.toByteArray(Charsets.UTF_8)
+        val size = 8 + magic.size + payload.size
+        val out = ByteArray(size)
+        writeBE32(out, 0, size)
+        out[4] = 'u'.code.toByte(); out[5] = 'u'.code.toByte()
+        out[6] = 'i'.code.toByte(); out[7] = 'd'.code.toByte()
+        System.arraycopy(magic, 0, out, 8, 16)
+        System.arraycopy(payload, 0, out, 24, payload.size)
         return out
     }
 
