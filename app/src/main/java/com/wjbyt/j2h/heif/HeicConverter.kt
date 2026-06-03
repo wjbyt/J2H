@@ -253,7 +253,16 @@ class HeicConverter(
                         snapshot.copy(gpsLat = resolvedGps.first, gpsLon = resolvedGps.second)
                         else snapshot
 
-                    val tiff = com.wjbyt.j2h.exif.DngExifExtractor.extractTiff(srcDngBytes, resolvedGps)
+                    // vivo's DNG embeds the internal model code ("V2454A"); swap
+                    // it for the marketing name ("vivo X200 Ultra") so 拍摄设备
+                    // matches the JPG / native-camera path.
+                    val deviceModel = vivoMarketName()
+                    if (deviceModel != null) com.wjbyt.j2h.work.ConversionForegroundService
+                        .appendLog("  · 设备名 Model → \"$deviceModel\"")
+
+                    val tiff = com.wjbyt.j2h.exif.DngExifExtractor.extractTiff(
+                        srcDngBytes, resolvedGps, deviceModel
+                    )
                         ?.also {
                             com.wjbyt.j2h.work.ConversionForegroundService
                                 .appendLog("  · DngExifExtractor: 直读 DNG TIFF (${it.size}B)")
@@ -390,6 +399,31 @@ class HeicConverter(
                 .appendLog("  · 已转换但删除原 JPG 失败 — 手动删除")
         }
         return Result.Ok(targetName, srcSize, outSize, "$label$metaNote")
+    }
+
+    /** Read an Android system property via reflection (hidden API). */
+    private fun systemProp(key: String): String? = try {
+        val c = Class.forName("android.os.SystemProperties")
+        (c.getMethod("get", String::class.java).invoke(null, key) as? String)
+            ?.takeIf { it.isNotBlank() }
+    } catch (_: Throwable) { null }
+
+    /**
+     * vivo's marketing name (e.g. "vivo X200 Ultra"), which its camera writes as
+     * the EXIF Model in JPG/native HEIC — unlike DNG, which carries the internal
+     * code ("V2454A"). Returns null if no marketing-name property resolves or it
+     * only echoes the internal Build.MODEL.
+     */
+    private fun vivoMarketName(): String? {
+        for (key in listOf(
+            "ro.vivo.market.name", "ro.vivo.product.marketname",
+            "ro.product.marketname", "ro.config.marketing_name",
+            "ro.product.model.display"
+        )) {
+            val v = systemProp(key) ?: continue
+            if (!v.equals(android.os.Build.MODEL, ignoreCase = true)) return v
+        }
+        return null
     }
 
     /**

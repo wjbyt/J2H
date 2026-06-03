@@ -90,7 +90,24 @@ object DngExifExtractor {
             .array()
     }
 
-    fun extractTiff(dng: ByteArray, fallbackGps: Pair<Double, Double>? = null): ByteArray? {
+    /** Build an ASCII Entry (inline when ≤4 bytes incl. NUL, else external). */
+    private fun asciiEntry(tag: Int, s: String): Entry {
+        val raw = s.toByteArray(Charsets.US_ASCII) + byteArrayOf(0)
+        return if (raw.size <= 4) Entry(tag, TYPE_ASCII, raw.size, packInline(raw), null)
+               else Entry(tag, TYPE_ASCII, raw.size, 0L, raw)
+    }
+
+    /**
+     * @param overrideModel when non-null, replaces IFD0's Model (0x0110). vivo's
+     *   DNG stores the internal code "V2454A"; the JPG/native path shows the
+     *   marketing name ("vivo X200 Ultra"). Passing the marketing name here makes
+     *   the DNG-converted HEIC's 拍摄设备 match the rest.
+     */
+    fun extractTiff(
+        dng: ByteArray,
+        fallbackGps: Pair<Double, Double>? = null,
+        overrideModel: String? = null
+    ): ByteArray? {
         if (dng.size < 16) return null
         val le = when {
             dng[0] == 'M'.code.toByte() && dng[1] == 'M'.code.toByte() -> false
@@ -128,6 +145,13 @@ object DngExifExtractor {
 
         // IFD0: TIFF-domain whitelist only (raw/strip/DNG-specific tags dropped).
         val keptIfd0 = ifd0.filter { it.tag in IFD0_KEEP }.toMutableList()
+
+        // Swap the DNG's internal model code (e.g. "V2454A") for the device's
+        // marketing name so 拍摄设备 matches the JPG / native-camera path.
+        if (!overrideModel.isNullOrBlank()) {
+            keptIfd0.removeAll { it.tag == 0x0110 }
+            keptIfd0 += asciiEntry(0x0110, overrideModel)
+        }
 
         // ExifIFD: union of a real ExifIFD (authoritative, listed first so it
         // wins on dedup) + EXIF tags loose in IFD0. MakerNote dropped — its
