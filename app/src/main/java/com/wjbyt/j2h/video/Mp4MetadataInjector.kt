@@ -67,66 +67,24 @@ object Mp4MetadataInjector {
         val moovBytes = ByteArray(moov.size.toInt())
         raf.readFully(moovBytes)
 
-        // Patch mvhd/tkhd shoot time in place (size-preserving) before any
-        // udta resize, so the patched bytes survive the splice below.
+        // Patch mvhd/tkhd shoot time in place (size-preserving).
         creationMp4Time?.let { patchCreationTimes(moovBytes, it) }
 
-        // Build the atoms to insert into udta (©mak/©mod in QuickTime text format).
-        val atoms = mutableListOf<ByteArray>()
-        if (!make.isNullOrBlank())  atoms += buildQtAtom("©mak", make)
-        if (!model.isNullOrBlank()) atoms += buildQtAtom("©mod", model)
+        // We deliberately do NOT touch udta. Earlier we injected ©mak/©mod text
+        // atoms there for the device name, but that BROKE vivo's location read
+        // for SDR videos (the gallery failed to parse ©xyz once extra atoms sat
+        // beside it). The device name comes from the vivo `uuid` box below, so
+        // ©mak/©mod were redundant anyway. Leaving udta exactly as MediaMuxer
+        // wrote it (just ©xyz from setLocation) matches a native vivo video and
+        // lets the gallery show 地点 for SDR.
 
-        // Nothing to add to udta — but we may have patched times; write back.
-        if (atoms.isEmpty()) {
-            raf.seek(moov.offset)
-            raf.write(moovBytes)
-            return creationMp4Time != null
-        }
-        val addSize = atoms.sumOf { it.size }
-
-        // Find udta inside moov (offset relative to moov start).
-        val udta = findChildBox(moovBytes, 8 /* skip moov 8-byte header */,
-                                moovBytes.size, "udta")
-
-        val newMoov: ByteArray = if (udta == null) {
-            // No existing udta — create one at end of moov containing our atoms.
-            val udtaSize = 8 + addSize
-            val udtaBytes = ByteArray(udtaSize)
-            writeBE32(udtaBytes, 0, udtaSize)
-            udtaBytes[4] = 'u'.code.toByte(); udtaBytes[5] = 'd'.code.toByte()
-            udtaBytes[6] = 't'.code.toByte(); udtaBytes[7] = 'a'.code.toByte()
-            var p = 8
-            for (a in atoms) { System.arraycopy(a, 0, udtaBytes, p, a.size); p += a.size }
-
-            val nm = ByteArray(moovBytes.size + udtaSize)
-            System.arraycopy(moovBytes, 0, nm, 0, moovBytes.size)
-            System.arraycopy(udtaBytes, 0, nm, moovBytes.size, udtaSize)
-            writeBE32(nm, 0, nm.size)  // patched moov size
-            nm
-        } else {
-            // Append our atoms inside existing udta. We slice moov in two,
-            // append our atoms after the existing udta content, then continue
-            // with the rest of moov.
-            val udtaEnd = udta.offset + udta.size  // offset within moov
-            val nm = ByteArray(moovBytes.size + addSize)
-            System.arraycopy(moovBytes, 0, nm, 0, udtaEnd)
-            var p = udtaEnd
-            for (a in atoms) { System.arraycopy(a, 0, nm, p, a.size); p += a.size }
-            System.arraycopy(moovBytes, udtaEnd, nm, p, moovBytes.size - udtaEnd)
-            // Patch sizes: udta + moov.
-            writeBE32(nm, udta.offset, udta.size + addSize)
-            writeBE32(nm, 0, nm.size)
-            nm
-        }
-
-        // Write the patched moov, then append the vivo uuid box as a top-level
-        // box AFTER moov — exactly how native vivo camera videos are structured.
-        // NOTE: this makes moov non-trailing. The gallery re-scan MUST be
-        // triggered AFTER this write (single setLastModified call in the caller,
-        // not before+after); otherwise a pre-injection scan caches wrong metadata.
+        // Write the (time-patched) moov unchanged in size, then append the vivo
+        // `uuid` box (vivoMediaExtInfo) as a top-level box after moov — this is
+        // what the gallery reads 拍摄设备 from, and how native vivo videos are laid
+        // out. The caller triggers a single re-scan afterwards.
         raf.seek(moov.offset)
-        raf.write(newMoov)
-        var end = moov.offset + newMoov.size
+        raf.write(moovBytes)
+        var end = moov.offset + moovBytes.size
         if (!model.isNullOrBlank()) {
             val uuidBox = buildVivoUuidBox(model)
             raf.seek(end)
