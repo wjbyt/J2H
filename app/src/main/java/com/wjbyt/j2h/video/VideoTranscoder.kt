@@ -433,12 +433,12 @@ object VideoTranscoder {
             // expose these atoms, so we patch the closed file.
             safPath(outFile.uri)?.let { p ->
                 val f = java.io.File(p)
-                try { f.setLastModified(srcMtime) } catch (_: Exception) {}
                 val mdl = Mp4MetadataInjector.marketModel()
-                // Read shoot time from the SOURCE video's mvhd, not from the
-                // file mtime (which is reset when the file is copied). Falls
-                // back to srcMtime if unavailable.
                 val creationMp4 = srcMp4CreationTime ?: (srcMtime / 1000L + 2082844800L)
+                // Inject BEFORE setLastModified so the gallery's first (and only)
+                // scan sees the complete file — moov + uuid box — just like a
+                // native vivo camera video. Two setLastModified calls would trigger
+                // two scans; the second would see a non-trailing moov and report -1×-1.
                 val injected = try {
                     Mp4MetadataInjector.inject(
                         f,
@@ -447,12 +447,13 @@ object VideoTranscoder {
                         creationMp4Time = creationMp4
                     )
                 } catch (_: Exception) { false }
+                // Single setLastModified AFTER injection: triggers exactly one gallery
+                // scan of the fully-patched file (correct mtime + uuid present).
+                try { f.setLastModified(srcMtime) } catch (_: Exception) {}
                 if (injected) {
                     com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
-                        "  · 已注入 ©mak/©mod(QT) + 拍摄时间: ${android.os.Build.MANUFACTURER} / $mdl"
+                        "  · 已注入 ©mak/©mod(QT) + 拍摄时间 + 设备: ${android.os.Build.MANUFACTURER} / $mdl"
                     )
-                    // mtime gets bumped by the rewrite — restore it.
-                    try { f.setLastModified(srcMtime) } catch (_: Exception) {}
                 }
             }
             val saved = if (srcSize > 0) (100 - outSize * 100 / srcSize) else 0L

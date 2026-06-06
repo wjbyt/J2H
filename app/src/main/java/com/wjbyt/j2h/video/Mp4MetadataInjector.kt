@@ -71,17 +71,10 @@ object Mp4MetadataInjector {
         // udta resize, so the patched bytes survive the splice below.
         creationMp4Time?.let { patchCreationTimes(moovBytes, it) }
 
-        // Build the atoms to insert into udta.
-        // ©mak/©mod: QuickTime text format [len][lang][utf8] — same as ©xyz.
-        // vivoMediaExtInfo: vivo's proprietary atom whose JSON takenmodel field
-        //   populates 拍摄设备. Must stay INSIDE udta (not after moov) so moov
-        //   remains the last top-level box; vivo shows -1×-1 otherwise.
+        // Build the atoms to insert into udta (©mak/©mod in QuickTime text format).
         val atoms = mutableListOf<ByteArray>()
         if (!make.isNullOrBlank())  atoms += buildQtAtom("©mak", make)
-        if (!model.isNullOrBlank()) {
-            atoms += buildQtAtom("©mod", model)
-            atoms += buildVivoUuidBox(model)
-        }
+        if (!model.isNullOrBlank()) atoms += buildQtAtom("©mod", model)
 
         // Nothing to add to udta — but we may have patched times; write back.
         if (atoms.isEmpty()) {
@@ -126,14 +119,21 @@ object Mp4MetadataInjector {
             nm
         }
 
-        // Replace moov in the file. moov was at the end, so we just truncate
-        // and rewrite — no offset tables in mdat to fix up.
-        // IMPORTANT: moov must remain the LAST top-level box. vivo fails to
-        // parse the file (shows -1×-1 and no metadata) when any box follows
-        // moov. So the vivo uuid box goes INSIDE udta, not after moov.
+        // Write the patched moov, then append the vivo uuid box as a top-level
+        // box AFTER moov — exactly how native vivo camera videos are structured.
+        // NOTE: this makes moov non-trailing. The gallery re-scan MUST be
+        // triggered AFTER this write (single setLastModified call in the caller,
+        // not before+after); otherwise a pre-injection scan caches wrong metadata.
         raf.seek(moov.offset)
         raf.write(newMoov)
-        raf.setLength(moov.offset + newMoov.size)
+        var end = moov.offset + newMoov.size
+        if (!model.isNullOrBlank()) {
+            val uuidBox = buildVivoUuidBox(model)
+            raf.seek(end)
+            raf.write(uuidBox)
+            end += uuidBox.size
+        }
+        raf.setLength(end)
         return true
     }
 
