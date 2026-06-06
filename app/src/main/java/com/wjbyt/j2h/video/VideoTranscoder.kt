@@ -136,11 +136,12 @@ object VideoTranscoder {
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            // 5-second GOP — same as Netflix/YouTube/Disney+ streaming
-            // mezzanines. Saves ~20-30 % bits vs. our old 2-second GOP at
-            // identical visual quality (P/B frames pack 5× more efficiently
-            // than I-frames). Slightly slower seeks; not noticeable.
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 5)
+            // 2-second GOP. A shorter keyframe interval lets quality "recover"
+            // faster after high-motion scenes — at a bitrate-constrained 4K60
+            // the previous 5-second GOP (300 frames) let motion degrade and
+            // judder mid-GOP. 2s trades a little compression efficiency for
+            // smoother large-motion playback without raising the bitrate.
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
 
             // Bitrate / quality mode is decided AFTER we open the codec and query its
             // EncoderCapabilities (BITRATE_MODE_CQ is encoder-specific). We patch the
