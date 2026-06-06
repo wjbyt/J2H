@@ -462,12 +462,18 @@ object VideoTranscoder {
                         creationMp4Time = creationMp4
                     )
                 } catch (_: Exception) { false }
-                try { f.setLastModified(srcMtime) } catch (_: Exception) {}
                 if (injected) {
                     com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                         "  · 已注入 ©mak/©mod(QT) + 拍摄时间 + 设备: ${android.os.Build.MANUFACTURER} / $mdl"
                     )
                 }
+                // Set mtime to NOW (not the shoot time). MediaScanner SKIPS
+                // re-scanning a file whose mtime isn't newer than its cached row;
+                // SAF registered a partial row at creation time, so a past mtime
+                // made the scanner ignore our final file → "首次缺信息" bug. The
+                // displayed shoot time comes from mvhd creation_time + MediaStore
+                // datetaken, NOT file mtime, so NOW is safe here.
+                try { f.setLastModified(System.currentTimeMillis()) } catch (_: Exception) {}
                 // Force MediaStore to re-scan the final injected file and write
                 // correct DATE_TAKEN / WIDTH / HEIGHT / GPS over any stale cache.
                 syncVideoMetadata(context, f, srcMeta, videoGpsLat, videoGpsLon)
