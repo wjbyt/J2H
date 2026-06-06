@@ -76,8 +76,10 @@ object VideoTranscoder {
 
         var videoTrack = -1
         var audioTrack = -1
+        var metaTrack = -1
         var videoFormat: MediaFormat? = null
         var audioFormat: MediaFormat? = null
+        var metaFormat: MediaFormat? = null
         for (i in 0 until extractor.trackCount) {
             val f = extractor.getTrackFormat(i)
             val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
@@ -85,6 +87,12 @@ object VideoTranscoder {
                 videoTrack = i; videoFormat = f
             } else if (mime.startsWith("audio/") && audioTrack < 0) {
                 audioTrack = i; audioFormat = f
+            } else if (metaTrack < 0 &&
+                       (mime.startsWith("application/") || mime.startsWith("meta"))) {
+                // vivo camera's timed-metadata track (e.g. application/3aDebugInfo
+                // — EIS/3A data). Copying it through marks the output as a
+                // vivo-camera video so the gallery shows 地点 for SDR too.
+                metaTrack = i; metaFormat = f
             }
         }
         if (videoTrack < 0 || videoFormat == null) {
@@ -309,6 +317,7 @@ object VideoTranscoder {
             var encoderOutputDone = false
             var muxerVideoTrack = -1
             var muxerAudioTrack = -1
+            var muxerMetaTrack = -1
             var muxerStarted = false
 
             // ---- Main video pump ----
@@ -378,6 +387,11 @@ object VideoTranscoder {
                         if (audioTrack >= 0 && audioFormat != null) {
                             muxerAudioTrack = mux.addTrack(audioFormat)
                         }
+                        // Best-effort: carry the vivo camera metadata track through
+                        // (marks the output as a camera video → gallery shows 地点).
+                        if (metaTrack >= 0 && metaFormat != null) {
+                            muxerMetaTrack = try { mux.addTrack(metaFormat) } catch (_: Throwable) { -1 }
+                        }
                         mux.start()
                         muxerStarted = true
                     }
@@ -412,6 +426,26 @@ object VideoTranscoder {
                     mux.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
                     extractor.advance()
                 }
+            }
+
+            // ---- Metadata (mett) sample copy (no transcode) — best-effort ----
+            if (muxerMetaTrack >= 0 && metaTrack >= 0) {
+                try {
+                    try { extractor.unselectTrack(videoTrack) } catch (_: Throwable) {}
+                    if (audioTrack >= 0) try { extractor.unselectTrack(audioTrack) } catch (_: Throwable) {}
+                    extractor.selectTrack(metaTrack)
+                    extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                    val metaBuf = ByteBuffer.allocate(1 shl 20)
+                    val metaInfo = MediaCodec.BufferInfo()
+                    while (true) {
+                        val sz = extractor.readSampleData(metaBuf, 0)
+                        if (sz < 0) break
+                        metaInfo.set(0, sz, extractor.sampleTime, extractor.sampleFlags)
+                        mux.writeSampleData(muxerMetaTrack, metaBuf, metaInfo)
+                        extractor.advance()
+                    }
+                    com.wjbyt.j2h.work.ConversionForegroundService.appendLog("  · 已复制相机元数据轨(mett)")
+                } catch (_: Throwable) {}
             }
 
             try { mux.stop() } catch (_: Exception) {}
