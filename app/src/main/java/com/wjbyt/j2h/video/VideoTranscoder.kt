@@ -419,10 +419,8 @@ object VideoTranscoder {
             val srcSize = input.length()
             val outSize = outFile.length()
             val srcMtime = input.lastModified()
-            // Read MP4 creation time from source mvhd before deleting the file.
-            // File mtime is unreliable (gets reset on copy); the mvhd value is
-            // what the camera originally wrote.
-            val srcMp4CreationTime = readSourceMp4Time(context, input.uri)
+            // Read source metadata before deleting the file.
+            val srcMeta = readSourceMeta(context, input.uri)
             if (!input.delete()) {
                 return Result.Failed("已转码但删除原视频失败", keepOriginal = true)
             }
@@ -434,7 +432,7 @@ object VideoTranscoder {
             safPath(outFile.uri)?.let { p ->
                 val f = java.io.File(p)
                 val mdl = Mp4MetadataInjector.marketModel()
-                val creationMp4 = srcMp4CreationTime ?: (srcMtime / 1000L + 2082844800L)
+                val creationMp4 = srcMeta.mp4Time ?: (srcMtime / 1000L + 2082844800L)
                 // Inject BEFORE setLastModified so the gallery's first (and only)
                 // scan sees the complete file — moov + uuid box — just like a
                 // native vivo camera video. Two setLastModified calls would trigger
@@ -454,14 +452,9 @@ object VideoTranscoder {
                         "  · 已注入 ©mak/©mod(QT) + 拍摄时间 + 设备: ${android.os.Build.MANUFACTURER} / $mdl"
                     )
                 }
-                // Force MediaStore to re-scan the FINAL file (after uuid is appended).
-                // Without this, Android's inotify may have already cached the file
-                // BEFORE injection completed, storing wrong metadata (-1×-1, no location).
-                // MediaScannerConnection re-scans from scratch so vivo gallery sees the
-                // correct structure (same layout as a native vivo camera video).
-                android.media.MediaScannerConnection.scanFile(
-                    context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null
-                )
+                // Force MediaStore to see the final injected file and update
+                // DATE_TAKEN / WIDTH / HEIGHT with correct source values.
+                syncVideoMetadata(context, f, srcMeta)
             }
             val saved = if (srcSize > 0) (100 - outSize * 100 / srcSize) else 0L
             val dvNote = if (isDolbyVisionInput) "（DV→HDR10+）" else ""
@@ -541,43 +534,70 @@ object VideoTranscoder {
         }
     }
 
-    /** Best-effort SAF URI → filesystem path; returns null if not derivable. */
-    /**
-     * Read the MP4 creation time from a source video's mvhd box.
-     * Returns seconds since the MP4 epoch (1904-01-01 UTC), suitable for
-     * passing directly to [Mp4MetadataInjector.inject]. Returns null on any
-     * error so callers can fall back to file mtime.
-     * Uses file mtime as a last resort, but prefers the container value because
-     * the file mtime is reset to "now" whenever the file is copied.
-     */
-    private fun readSourceMp4Time(context: android.content.Context, uri: android.net.Uri): Long? {
+    private data class SourceMeta(
+        val mp4Time: Long?,    // seconds since 1904-01-01 UTC (for Mp4MetadataInjector)
+        val shootMs: Long?,    // milliseconds since 1970-01-01 (for MediaStore DATE_TAKEN)
+        val width: Int,
+        val height: Int
+    )
+
+    /** Read key metadata from the source video via MediaMetadataRetriever. */
+    private fun readSourceMeta(context: android.content.Context, uri: android.net.Uri): SourceMeta {
+        val mmr = android.media.MediaMetadataRetriever()
         return try {
-            context.contentResolver.openInputStream(uri)?.use { ins ->
-                // Skip until we find "moov" then "mvhd".
-                // For simplicity we read the first 64 KB which always contains
-                // the moov header for a vivo camera video (moov is trailing, but
-                // ftyp + a very small amount of data is at the front — however
-                // MediaMuxer puts moov at the END, so we use MediaMetadataRetriever
-                // instead, which reads the moov without streaming the whole file.
-                null  // fall through to MMR below
+            mmr.setDataSource(context, uri)
+            val w = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            val h = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            val dateStr = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DATE)
+            var mp4t: Long? = null; var shootMs: Long? = null
+            if (!dateStr.isNullOrBlank()) {
+                val clean = dateStr.replace("-","").replace(":","")
+                val sdf = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", java.util.Locale.US)
+                sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                val t = try { sdf.parse(clean.take(15))?.time } catch (_: Exception) { null }
+                if (t != null) { mp4t = t / 1000L + 2082844800L; shootMs = t }
             }
-            val mmr = android.media.MediaMetadataRetriever()
-            try {
-                mmr.setDataSource(context, uri)
-                // DATE key is "YYYY-MM-DDTHH:MM:SS.sss±HH:MM" — parse to epoch.
-                val dateStr = mmr.extractMetadata(
-                    android.media.MediaMetadataRetriever.METADATA_KEY_DATE)
-                if (!dateStr.isNullOrBlank()) {
-                    // Format: "20260601T215531.000+0000" or "20260601T215531+0000"
-                    val clean = dateStr.replace("-","").replace(":","")
-                    val sdf = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", java.util.Locale.US)
-                    sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
-                    val t = try { sdf.parse(clean.take(15))?.time } catch (_: Exception) { null }
-                    if (t != null) return@readSourceMp4Time t / 1000L + 2082844800L
-                }
+            SourceMeta(mp4t, shootMs, w, h)
+        } catch (_: Exception) { SourceMeta(null, null, 0, 0) }
+        finally { mmr.release() }
+    }
+
+    /**
+     * After injection, force MediaStore to see the final file and update
+     * DATE_TAKEN / WIDTH / HEIGHT with correct source values.
+     * On API 30+: MediaStore.scanFile (synchronous) + explicit update.
+     * Below API 30: async MediaScannerConnection.scanFile.
+     * MANAGE_EXTERNAL_STORAGE lets us update rows we don't own.
+     */
+    private fun syncVideoMetadata(
+        context: android.content.Context, f: java.io.File, meta: SourceMeta
+    ) {
+        try {
+            val scannedUri = if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.provider.MediaStore.scanFile(context, f)
+            } else {
+                android.media.MediaScannerConnection.scanFile(
+                    context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null)
                 null
-            } finally { mmr.release() }
-        } catch (_: Exception) { null }
+            }
+            // Use synchronous scan result URI, or fall back to query by path.
+            val uri = scannedUri ?: run {
+                val col = android.provider.MediaStore.Video.Media
+                    .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                context.contentResolver.query(col,
+                    arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                    "${android.provider.MediaStore.MediaColumns.DATA}=?",
+                    arrayOf(f.absolutePath), null)?.use { c ->
+                    if (c.moveToFirst()) android.content.ContentUris.withAppendedId(col, c.getLong(0))
+                    else null
+                }
+            } ?: return
+            val cv = android.content.ContentValues()
+            meta.shootMs?.let { cv.put(android.provider.MediaStore.Video.Media.DATE_TAKEN, it) }
+            if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
+            if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
+            if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
+        } catch (_: Exception) {}
     }
 
     private fun safPath(uri: android.net.Uri): String? {
