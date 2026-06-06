@@ -651,24 +651,19 @@ object VideoTranscoder {
         context: android.content.Context, f: java.io.File, meta: SourceMeta
     ) {
         try {
-            val scannedUri = if (android.os.Build.VERSION.SDK_INT >= 30) {
-                android.provider.MediaStore.scanFile(context, f)
-            } else {
-                android.media.MediaScannerConnection.scanFile(
-                    context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null)
-                null
-            }
-            // Use synchronous scan result URI, or fall back to query by path.
-            val uri = scannedUri ?: run {
-                val col = android.provider.MediaStore.Video.Media
-                    .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                context.contentResolver.query(col,
-                    arrayOf(android.provider.MediaStore.MediaColumns._ID),
-                    "${android.provider.MediaStore.MediaColumns.DATA}=?",
-                    arrayOf(f.absolutePath), null)?.use { c ->
-                    if (c.moveToFirst()) android.content.ContentUris.withAppendedId(col, c.getLong(0))
-                    else null
-                }
+            // Trigger a re-scan and update MediaStore with correct metadata.
+            // MediaScannerConnection.scanFile is async; after it queues, we
+            // immediately query MediaStore for the existing row and push our values.
+            android.media.MediaScannerConnection.scanFile(
+                context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null)
+            val col = android.provider.MediaStore.Video.Media
+                .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val uri = context.contentResolver.query(col,
+                arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                "${android.provider.MediaStore.MediaColumns.DATA}=?",
+                arrayOf(f.absolutePath), null)?.use { c ->
+                if (c.moveToFirst()) android.content.ContentUris.withAppendedId(col, c.getLong(0))
+                else null
             } ?: return
             val cv = android.content.ContentValues()
             meta.shootMs?.let { cv.put("datetaken", it) }
