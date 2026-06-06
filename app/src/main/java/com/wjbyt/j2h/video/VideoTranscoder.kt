@@ -419,6 +419,10 @@ object VideoTranscoder {
             val srcSize = input.length()
             val outSize = outFile.length()
             val srcMtime = input.lastModified()
+            // Read MP4 creation time from source mvhd before deleting the file.
+            // File mtime is unreliable (gets reset on copy); the mvhd value is
+            // what the camera originally wrote.
+            val srcMp4CreationTime = readSourceMp4Time(context, input.uri)
             if (!input.delete()) {
                 return Result.Failed("已转码但删除原视频失败", keepOriginal = true)
             }
@@ -431,8 +435,10 @@ object VideoTranscoder {
                 val f = java.io.File(p)
                 try { f.setLastModified(srcMtime) } catch (_: Exception) {}
                 val mdl = Mp4MetadataInjector.marketModel()
-                // Source shoot time → MP4 epoch (secs since 1904-01-01 UTC).
-                val creationMp4 = srcMtime / 1000L + 2082844800L
+                // Read shoot time from the SOURCE video's mvhd, not from the
+                // file mtime (which is reset when the file is copied). Falls
+                // back to srcMtime if unavailable.
+                val creationMp4 = srcMp4CreationTime ?: (srcMtime / 1000L + 2082844800L)
                 val injected = try {
                     Mp4MetadataInjector.inject(
                         f,
@@ -528,6 +534,44 @@ object VideoTranscoder {
     }
 
     /** Best-effort SAF URI → filesystem path; returns null if not derivable. */
+    /**
+     * Read the MP4 creation time from a source video's mvhd box.
+     * Returns seconds since the MP4 epoch (1904-01-01 UTC), suitable for
+     * passing directly to [Mp4MetadataInjector.inject]. Returns null on any
+     * error so callers can fall back to file mtime.
+     * Uses file mtime as a last resort, but prefers the container value because
+     * the file mtime is reset to "now" whenever the file is copied.
+     */
+    private fun readSourceMp4Time(context: android.content.Context, uri: android.net.Uri): Long? {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { ins ->
+                // Skip until we find "moov" then "mvhd".
+                // For simplicity we read the first 64 KB which always contains
+                // the moov header for a vivo camera video (moov is trailing, but
+                // ftyp + a very small amount of data is at the front — however
+                // MediaMuxer puts moov at the END, so we use MediaMetadataRetriever
+                // instead, which reads the moov without streaming the whole file.
+                null  // fall through to MMR below
+            }
+            val mmr = android.media.MediaMetadataRetriever()
+            try {
+                mmr.setDataSource(context, uri)
+                // DATE key is "YYYY-MM-DDTHH:MM:SS.sss±HH:MM" — parse to epoch.
+                val dateStr = mmr.extractMetadata(
+                    android.media.MediaMetadataRetriever.METADATA_KEY_DATE)
+                if (!dateStr.isNullOrBlank()) {
+                    // Format: "20260601T215531.000+0000" or "20260601T215531+0000"
+                    val clean = dateStr.replace("-","").replace(":","")
+                    val sdf = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", java.util.Locale.US)
+                    sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                    val t = try { sdf.parse(clean.take(15))?.time } catch (_: Exception) { null }
+                    if (t != null) return@readSourceMp4Time t / 1000L + 2082844800L
+                }
+                null
+            } finally { mmr.release() }
+        } catch (_: Exception) { null }
+    }
+
     private fun safPath(uri: android.net.Uri): String? {
         return try {
             val docId = android.provider.DocumentsContract.getDocumentId(uri)
