@@ -264,14 +264,15 @@ object VideoTranscoder {
             decoder.start()
             encoder.start()
 
-            muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val mux = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = mux  // keep nullable ref for finally{} cleanup
 
             // Preserve metadata that gallery apps display: rotation + GPS.
             // MediaMuxer doesn't copy these from the source automatically.
             try {
                 val rotation = if (videoFormat.containsKey(MediaFormat.KEY_ROTATION))
                     videoFormat.getInteger(MediaFormat.KEY_ROTATION) else 0
-                if (rotation != 0) muxer.setOrientationHint(rotation)
+                if (rotation != 0) mux.setOrientationHint(rotation)
             } catch (_: Throwable) {}
             var videoGpsLat: Float? = null
             var videoGpsLon: Float? = null
@@ -290,7 +291,7 @@ object VideoTranscoder {
                             val lon = m.groupValues[2].toFloatOrNull()
                             if (lat != null && lon != null) {
                                 videoGpsLat = lat; videoGpsLon = lon
-                                muxer.setLocation(lat, lon)
+                                mux.setLocation(lat, lon)
                                 com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                                     "  · 视频 GPS 透传: $lat, $lon"
                                 )
@@ -373,11 +374,11 @@ object VideoTranscoder {
                 when {
                     encOutIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         if (muxerStarted) return Result.Failed("encoder format changed twice")
-                        muxerVideoTrack = muxer.addTrack(encoder.outputFormat)
+                        muxerVideoTrack = mux.addTrack(encoder.outputFormat)
                         if (audioTrack >= 0 && audioFormat != null) {
-                            muxerAudioTrack = muxer.addTrack(audioFormat)
+                            muxerAudioTrack = mux.addTrack(audioFormat)
                         }
-                        muxer.start()
+                        mux.start()
                         muxerStarted = true
                     }
                     encOutIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {}
@@ -387,7 +388,7 @@ object VideoTranscoder {
                         if (outBuf != null && info.size > 0 && muxerStarted && !isCfg) {
                             outBuf.position(info.offset)
                             outBuf.limit(info.offset + info.size)
-                            muxer.writeSampleData(muxerVideoTrack, outBuf, info)
+                            mux.writeSampleData(muxerVideoTrack, outBuf, info)
                         }
                         encoder.releaseOutputBuffer(encOutIdx, false)
                         if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -408,13 +409,13 @@ object VideoTranscoder {
                     val sz = extractor.readSampleData(audioBuf, 0)
                     if (sz < 0) break
                     audioInfo.set(0, sz, extractor.sampleTime, extractor.sampleFlags)
-                    muxer.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
+                    mux.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
                     extractor.advance()
                 }
             }
 
-            try { muxer.stop() } catch (_: Exception) {}
-            try { muxer.release() } catch (_: Exception) {}
+            try { mux.stop() } catch (_: Exception) {}
+            try { mux.release() } catch (_: Exception) {}
             muxer = null
             // CRITICAL: close the fd so MediaMuxer's buffered data is flushed to
             // disk BEFORE we read size / verify / delete the source. Without this
@@ -581,25 +582,21 @@ object VideoTranscoder {
      * After injection, force MediaStore to re-scan the final file and overwrite
      * any stale cached metadata (DATE_TAKEN / WIDTH / HEIGHT / GPS) with correct
      * source values. MANAGE_EXTERNAL_STORAGE lets us update the row.
-     * Uses synchronous MediaStore.scanFile on API 30+ to get the canonical URI;
-     * falls back to query-by-path on older versions.
+     * Triggers MediaScannerConnection.scanFile, then locates the row by _data
+     * path and overwrites the metadata columns.
      */
     private fun syncVideoMetadata(
         context: android.content.Context, f: java.io.File, meta: SourceMeta,
         gpsLat: Float?, gpsLon: Float?
     ) {
         try {
-            val scanned: android.net.Uri? =
-                if (android.os.Build.VERSION.SDK_INT >= 30)
-                    android.provider.MediaStore.scanFile(context, f)
-                else {
-                    android.media.MediaScannerConnection.scanFile(
-                        context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null)
-                    null
-                }
+            // Trigger a fresh scan of the final file (async). We then locate the
+            // row by _data path and overwrite the metadata columns.
+            android.media.MediaScannerConnection.scanFile(
+                context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null)
             val col = android.provider.MediaStore.Video.Media
                 .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            val uri = scanned ?: context.contentResolver.query(col,
+            val uri = context.contentResolver.query(col,
                 arrayOf(android.provider.MediaStore.MediaColumns._ID),
                 "${android.provider.MediaStore.MediaColumns.DATA}=?",
                 arrayOf(f.absolutePath), null)?.use { c ->
