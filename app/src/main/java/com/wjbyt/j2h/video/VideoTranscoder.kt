@@ -161,22 +161,38 @@ object VideoTranscoder {
         val outFile: androidx.documentfile.provider.DocumentFile
         val pfd: android.os.ParcelFileDescriptor
         if (msInsertUri != null) {
-            outFile = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, msInsertUri)
-                ?: run { context.contentResolver.delete(msInsertUri,null,null); extractor.release()
-                         return Result.Failed("DocumentFile.fromSingleUri failed") }
-            pfd = try { context.contentResolver.openFileDescriptor(msInsertUri, "rw") }
-                  catch (e: Exception) { context.contentResolver.delete(msInsertUri,null,null); extractor.release()
-                                         return Result.Failed("openFileDescriptor(ms): ${e.message}") }
-                  ?: run { context.contentResolver.delete(msInsertUri,null,null); extractor.release()
-                            return Result.Failed("openFileDescriptor(ms) null") }
+            val tmpOut = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, msInsertUri)
+            if (tmpOut == null) {
+                context.contentResolver.delete(msInsertUri, null, null); extractor.release()
+                return Result.Failed("DocumentFile.fromSingleUri failed")
+            }
+            outFile = tmpOut
+            val tmpPfd = try {
+                context.contentResolver.openFileDescriptor(msInsertUri, "rw")
+            } catch (e: Exception) {
+                context.contentResolver.delete(msInsertUri, null, null); extractor.release()
+                return Result.Failed("openFileDescriptor(ms): ${e.message}")
+            }
+            if (tmpPfd == null) {
+                context.contentResolver.delete(msInsertUri, null, null); extractor.release()
+                return Result.Failed("openFileDescriptor(ms) null")
+            }
+            pfd = tmpPfd
         } else {
-            outFile = parent.createFile("video/mp4", targetName)
-                ?: run { extractor.release(); return Result.Failed("无法创建输出文件") }
-            pfd = try { context.contentResolver.openFileDescriptor(outFile.uri, "rw") }
-                  catch (e: Exception) { outFile.delete(); extractor.release()
-                                         return Result.Failed("openFileDescriptor: ${e.message}") }
-                  ?: run { outFile.delete(); extractor.release()
-                            return Result.Failed("openFileDescriptor returned null") }
+            val tmpOut = parent.createFile("video/mp4", targetName)
+            if (tmpOut == null) { extractor.release(); return Result.Failed("无法创建输出文件") }
+            outFile = tmpOut
+            val tmpPfd = try {
+                context.contentResolver.openFileDescriptor(outFile.uri, "rw")
+            } catch (e: Exception) {
+                outFile.delete(); extractor.release()
+                return Result.Failed("openFileDescriptor: ${e.message}")
+            }
+            if (tmpPfd == null) {
+                outFile.delete(); extractor.release()
+                return Result.Failed("openFileDescriptor returned null")
+            }
+            pfd = tmpPfd
         }
 
         var encoder: MediaCodec? = null
