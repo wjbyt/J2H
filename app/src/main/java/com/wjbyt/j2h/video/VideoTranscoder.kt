@@ -585,50 +585,27 @@ object VideoTranscoder {
     }
 
     /**
-     * After injection, force MediaStore to re-scan the final file and overwrite
-     * any stale cached metadata (DATE_TAKEN / WIDTH / HEIGHT / GPS) with correct
-     * source values. MANAGE_EXTERNAL_STORAGE lets us update the row.
-     * Triggers MediaScannerConnection.scanFile, then locates the row by _data
-     * path and overwrites the metadata columns.
+     * Trigger a single, fresh MediaStore scan of the final injected file and
+     * BLOCK until it completes. We deliberately do NOT update any MediaStore
+     * columns afterwards: a pure OS scan reads resolution / shoot-time / device
+     * (uuid) / location (©xyz) straight from the file — exactly what happens when
+     * the user copies the file elsewhere, which always displayed all four fields
+     * correctly. Writing latitude/longitude columns (deprecated on Video.Media)
+     * was interfering and suppressing the location, so it's removed entirely.
+     *
+     * Never call contentResolver.delete() here — MediaStore.delete removes the
+     * physical file (caused data loss previously). Scan-only is safe.
      */
     private fun syncVideoMetadata(
         context: android.content.Context, f: java.io.File, meta: SourceMeta,
         gpsLat: Float?, gpsLon: Float?
     ) {
-        // NOTE: never call contentResolver.delete() here — MediaStore.delete
-        // removes the PHYSICAL FILE too (data loss). We only scan + UPDATE.
-        val col = android.provider.MediaStore.Video.Media
-            .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
-
-        // Scan and WAIT (blocking, with timeout) for completion. scanFile's
-        // callback fires on its own thread; if we returned immediately the
-        // foreground service could stop before the scan/update ran, leaving the
-        // gallery showing the auto-scanner's partial cache (the "首次缺信息" bug).
-        val scannedUri = java.util.concurrent.atomic.AtomicReference<android.net.Uri?>(null)
         val latch = java.util.concurrent.CountDownLatch(1)
         try {
             android.media.MediaScannerConnection.scanFile(
                 context, arrayOf(f.absolutePath), arrayOf("video/mp4")
-            ) { _, uri -> scannedUri.set(uri); latch.countDown() }
+            ) { _, _ -> latch.countDown() }
             latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
-        } catch (_: Exception) {}
-
-        try {
-            val uri = scannedUri.get() ?: context.contentResolver.query(col,
-                arrayOf(android.provider.MediaStore.MediaColumns._ID),
-                "${android.provider.MediaStore.MediaColumns.DATA}=?",
-                arrayOf(f.absolutePath), null)?.use { c ->
-                if (c.moveToFirst())
-                    android.content.ContentUris.withAppendedId(col, c.getLong(0))
-                else null
-            } ?: return
-            val cv = android.content.ContentValues()
-            meta.shootMs?.let { cv.put("datetaken", it) }
-            if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
-            if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
-            gpsLat?.let { cv.put("latitude",  it.toDouble()) }
-            gpsLon?.let { cv.put("longitude", it.toDouble()) }
-            if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
         } catch (_: Exception) {}
     }
 
