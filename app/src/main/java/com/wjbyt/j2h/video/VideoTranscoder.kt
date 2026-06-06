@@ -447,14 +447,21 @@ object VideoTranscoder {
                         creationMp4Time = creationMp4
                     )
                 } catch (_: Exception) { false }
-                // Single setLastModified AFTER injection: triggers exactly one gallery
-                // scan of the fully-patched file (correct mtime + uuid present).
+                // Set mtime to shoot time (cosmetic; doesn't affect gallery scan).
                 try { f.setLastModified(srcMtime) } catch (_: Exception) {}
                 if (injected) {
                     com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                         "  · 已注入 ©mak/©mod(QT) + 拍摄时间 + 设备: ${android.os.Build.MANUFACTURER} / $mdl"
                     )
                 }
+                // Force MediaStore to re-scan the FINAL file (after uuid is appended).
+                // Without this, Android's inotify may have already cached the file
+                // BEFORE injection completed, storing wrong metadata (-1×-1, no location).
+                // MediaScannerConnection re-scans from scratch so vivo gallery sees the
+                // correct structure (same layout as a native vivo camera video).
+                android.media.MediaScannerConnection.scanFile(
+                    context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null
+                )
             }
             val saved = if (srcSize > 0) (100 - outSize * 100 / srcSize) else 0L
             val dvNote = if (isDolbyVisionInput) "（DV→HDR10+）" else ""
