@@ -223,10 +223,19 @@ object Mp4MetadataInjector {
     private fun buildVivoUuidBox(model: String): ByteArray {
         val magic = "vivoMediaExtInfo".toByteArray(Charsets.US_ASCII)  // exactly 16 bytes
         val safe = model.replace("\\", "").replace("\"", "")
+        // Include the same fields a native vivo camera video writes so the gallery
+        // recognises this as a vivo-produced video and shows 拍摄设备.
         val json = "vivo{" +
             "\"com.android.camera.takenmodel\":\"$safe\"," +
             "\"com.android.camera.moduleid\":\"video\"," +
-            "\"com.android.camera.camerafacing\":\"0\"}"
+            "\"com.android.camera.camerafacing\":\"0\"," +
+            "\"VideoModuleId\":\"video\"," +
+            "\"Lens\":\"Wide\"," +
+            "\"MotionTrack\":\"off\"," +
+            "\"Facing\":\"back\"," +
+            "\"FilmFormat\":\"false\"," +
+            "\"MicDevice\":\"MicDevice\"," +
+            "\"version\":2104}"
         val payload = json.toByteArray(Charsets.UTF_8)
         val size = 8 + magic.size + payload.size
         val out = ByteArray(size)

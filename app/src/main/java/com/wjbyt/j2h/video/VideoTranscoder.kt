@@ -153,18 +153,30 @@ object VideoTranscoder {
             }
         }
 
-        // Open output via SAF. Stale temp from a previous interrupted run is
-        // cleaned up at the top of transcode(); no per-attempt delete here.
-        val outFile = parent.createFile("video/mp4", targetName)
-            ?: run { extractor.release(); return Result.Failed("无法创建输出文件") }
-        val pfd = try {
-            context.contentResolver.openFileDescriptor(outFile.uri, "rw")
-        } catch (e: Exception) {
-            outFile.delete(); extractor.release()
-            return Result.Failed("openFileDescriptor: ${e.message}")
-        } ?: run {
-            outFile.delete(); extractor.release()
-            return Result.Failed("openFileDescriptor returned null")
+        // Try to create the output via MediaStore.insert (IS_PENDING=1) so we
+        // OWN the row and can set all metadata after encoding — no race with
+        // the auto-scanner. Fall back to SAF if the parent isn't a primary
+        // external directory MediaStore can address.
+        val msInsertUri = tryInsertPendingVideo(context, parent.uri, targetName)
+        val outFile: androidx.documentfile.provider.DocumentFile
+        val pfd: android.os.ParcelFileDescriptor
+        if (msInsertUri != null) {
+            outFile = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, msInsertUri)
+                ?: run { context.contentResolver.delete(msInsertUri,null,null); extractor.release()
+                         return Result.Failed("DocumentFile.fromSingleUri failed") }
+            pfd = try { context.contentResolver.openFileDescriptor(msInsertUri, "rw") }
+                  catch (e: Exception) { context.contentResolver.delete(msInsertUri,null,null); extractor.release()
+                                         return Result.Failed("openFileDescriptor(ms): ${e.message}") }
+                  ?: run { context.contentResolver.delete(msInsertUri,null,null); extractor.release()
+                            return Result.Failed("openFileDescriptor(ms) null") }
+        } else {
+            outFile = parent.createFile("video/mp4", targetName)
+                ?: run { extractor.release(); return Result.Failed("无法创建输出文件") }
+            pfd = try { context.contentResolver.openFileDescriptor(outFile.uri, "rw") }
+                  catch (e: Exception) { outFile.delete(); extractor.release()
+                                         return Result.Failed("openFileDescriptor: ${e.message}") }
+                  ?: run { outFile.delete(); extractor.release()
+                            return Result.Failed("openFileDescriptor returned null") }
         }
 
         var encoder: MediaCodec? = null
@@ -270,6 +282,8 @@ object VideoTranscoder {
                     videoFormat.getInteger(MediaFormat.KEY_ROTATION) else 0
                 if (rotation != 0) muxer.setOrientationHint(rotation)
             } catch (_: Throwable) {}
+            var videoGpsLat: Float? = null
+            var videoGpsLon: Float? = null
             try {
                 val mmr = android.media.MediaMetadataRetriever()
                 try {
@@ -284,6 +298,7 @@ object VideoTranscoder {
                             val lat = m.groupValues[1].toFloatOrNull()
                             val lon = m.groupValues[2].toFloatOrNull()
                             if (lat != null && lon != null) {
+                                videoGpsLat = lat; videoGpsLon = lon
                                 muxer.setLocation(lat, lon)
                                 com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                                     "  · 视频 GPS 透传: $lat, $lon"
@@ -445,16 +460,18 @@ object VideoTranscoder {
                         creationMp4Time = creationMp4
                     )
                 } catch (_: Exception) { false }
-                // Set mtime to shoot time (cosmetic; doesn't affect gallery scan).
                 try { f.setLastModified(srcMtime) } catch (_: Exception) {}
                 if (injected) {
                     com.wjbyt.j2h.work.ConversionForegroundService.appendLog(
                         "  · 已注入 ©mak/©mod(QT) + 拍摄时间 + 设备: ${android.os.Build.MANUFACTURER} / $mdl"
                     )
                 }
-                // Force MediaStore to see the final injected file and update
-                // DATE_TAKEN / WIDTH / HEIGHT with correct source values.
-                syncVideoMetadata(context, f, srcMeta)
+                // Publish MediaStore row (we own it via insert) OR force-rescan.
+                if (msInsertUri != null) {
+                    publishVideoMediaStore(context, msInsertUri, srcMeta, videoGpsLat, videoGpsLon)
+                } else {
+                    syncVideoMetadata(context, f, srcMeta)
+                }
             }
             val saved = if (srcSize > 0) (100 - outSize * 100 / srcSize) else 0L
             val dvNote = if (isDolbyVisionInput) "（DV→HDR10+）" else ""
@@ -569,6 +586,49 @@ object VideoTranscoder {
      * Below API 30: async MediaScannerConnection.scanFile.
      * MANAGE_EXTERNAL_STORAGE lets us update rows we don't own.
      */
+    /** Insert a pending MediaStore video row; returns its URI or null on failure. */
+    private fun tryInsertPendingVideo(
+        context: android.content.Context,
+        parentUri: android.net.Uri,
+        targetName: String
+    ): android.net.Uri? {
+        return try {
+            val docId = try { android.provider.DocumentsContract.getTreeDocumentId(parentUri) }
+                        catch (_: Exception) { android.provider.DocumentsContract.getDocumentId(parentUri) }
+            val parts = docId.split(":", limit = 2)
+            if (parts[0] != "primary") return null
+            val rel = parts.getOrNull(1).orEmpty().let { if (it.isEmpty()) return null else "$it/" }
+            val col = android.provider.MediaStore.Video.Media
+                .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val cv = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, targetName)
+                put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel)
+                put(android.provider.MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            context.contentResolver.insert(col, cv)
+        } catch (_: Exception) { null }
+    }
+
+    /** Publish a MediaStore video row (IS_PENDING→0) and set metadata we own. */
+    private fun publishVideoMediaStore(
+        context: android.content.Context,
+        uri: android.net.Uri,
+        meta: SourceMeta,
+        gpsLat: Float?, gpsLon: Float?
+    ) {
+        try {
+            val cv = android.content.ContentValues()
+            cv.put(android.provider.MediaStore.Video.Media.IS_PENDING, 0)
+            meta.shootMs?.let { cv.put(android.provider.MediaStore.Video.Media.DATE_TAKEN, it) }
+            if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
+            if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
+            gpsLat?.let { cv.put(android.provider.MediaStore.Video.Media.LATITUDE, it.toDouble()) }
+            gpsLon?.let { cv.put(android.provider.MediaStore.Video.Media.LONGITUDE, it.toDouble()) }
+            context.contentResolver.update(uri, cv, null, null)
+        } catch (_: Exception) {}
+    }
+
     private fun syncVideoMetadata(
         context: android.content.Context, f: java.io.File, meta: SourceMeta
     ) {
