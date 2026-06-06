@@ -604,7 +604,7 @@ object VideoTranscoder {
                 put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, targetName)
                 put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
                 put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel)
-                put(android.provider.MediaStore.Video.Media.IS_PENDING, 1)
+                put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
             }
             context.contentResolver.insert(col, cv)
         } catch (_: Exception) { null }
@@ -619,12 +619,14 @@ object VideoTranscoder {
     ) {
         try {
             val cv = android.content.ContentValues()
-            cv.put(android.provider.MediaStore.Video.Media.IS_PENDING, 0)
-            meta.shootMs?.let { cv.put(android.provider.MediaStore.Video.Media.DATE_TAKEN, it) }
+            cv.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+            // Use MediaStore.MediaColumns constants (safe cross-version) and string
+            // literals for GPS (LATITUDE/LONGITUDE are not in VideoColumns).
+            meta.shootMs?.let { cv.put("datetaken", it) }
             if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
             if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
-            gpsLat?.let { cv.put(android.provider.MediaStore.Video.Media.LATITUDE, it.toDouble()) }
-            gpsLon?.let { cv.put(android.provider.MediaStore.Video.Media.LONGITUDE, it.toDouble()) }
+            gpsLat?.let { cv.put("latitude",  it.toDouble()) }
+            gpsLon?.let { cv.put("longitude", it.toDouble()) }
             context.contentResolver.update(uri, cv, null, null)
         } catch (_: Exception) {}
     }
