@@ -655,7 +655,7 @@ object VideoTranscoder {
                 }
             } ?: return
             val cv = android.content.ContentValues()
-            meta.shootMs?.let { cv.put(android.provider.MediaStore.Video.Media.DATE_TAKEN, it) }
+            meta.shootMs?.let { cv.put("datetaken", it) }
             if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
             if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
             if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
