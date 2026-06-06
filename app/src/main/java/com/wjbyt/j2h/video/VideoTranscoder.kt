@@ -620,27 +620,49 @@ object VideoTranscoder {
     }
 
     /**
-     * Trigger a single, fresh MediaStore scan of the final injected file and
-     * BLOCK until it completes. We deliberately do NOT update any MediaStore
-     * columns afterwards: a pure OS scan reads resolution / shoot-time / device
-     * (uuid) / location (©xyz) straight from the file — exactly what happens when
-     * the user copies the file elsewhere, which always displayed all four fields
-     * correctly. Writing latitude/longitude columns (deprecated on Video.Media)
-     * was interfering and suppressing the location, so it's removed entirely.
-     *
-     * Never call contentResolver.delete() here — MediaStore.delete removes the
-     * physical file (caused data loss previously). Scan-only is safe.
+     * Scan the final injected file (blocking) so the gallery picks up location
+     * (from ©xyz + the copied mett camera-track) and device (from the uuid box).
+     * THEN explicitly overwrite WIDTH / HEIGHT / datetaken with our known-good
+     * source values — the auto-scan intermittently caches -1×-1 when it races a
+     * still-flushing file (esp. fast-encoding SDR clips). We do NOT touch
+     * latitude/longitude (those are read from the file; writing the deprecated
+     * Video.Media GPS columns suppressed location). No contentResolver.delete
+     * (that removes the physical file → data loss).
      */
     private fun syncVideoMetadata(
         context: android.content.Context, f: java.io.File, meta: SourceMeta,
         gpsLat: Float?, gpsLon: Float?
     ) {
         val latch = java.util.concurrent.CountDownLatch(1)
+        val scannedUri = java.util.concurrent.atomic.AtomicReference<android.net.Uri?>(null)
         try {
             android.media.MediaScannerConnection.scanFile(
                 context, arrayOf(f.absolutePath), arrayOf("video/mp4")
-            ) { _, _ -> latch.countDown() }
+            ) { _, uri -> scannedUri.set(uri); latch.countDown() }
             latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: Exception) {}
+
+        // Overwrite resolution + shoot-time columns (NOT GPS) in case the scan
+        // raced a still-flushing file and stored -1×-1. Location is left to the
+        // file scan (©xyz + mett) — writing GPS columns suppressed it.
+        try {
+            val col = android.provider.MediaStore.Video.Media
+                .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val uri = scannedUri.get() ?: context.contentResolver.query(col,
+                arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                "${android.provider.MediaStore.MediaColumns.DATA}=?",
+                arrayOf(f.absolutePath), null)?.use { c ->
+                if (c.moveToFirst())
+                    android.content.ContentUris.withAppendedId(col, c.getLong(0))
+                else null
+            }
+            if (uri != null) {
+                val cv = android.content.ContentValues()
+                if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
+                if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
+                meta.shootMs?.let { cv.put("datetaken", it) }
+                if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
+            }
         } catch (_: Exception) {}
     }
 
