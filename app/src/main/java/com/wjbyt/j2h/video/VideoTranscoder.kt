@@ -589,38 +589,40 @@ object VideoTranscoder {
         context: android.content.Context, f: java.io.File, meta: SourceMeta,
         gpsLat: Float?, gpsLon: Float?
     ) {
+        // NOTE: never call contentResolver.delete() here — MediaStore.delete
+        // removes the PHYSICAL FILE too (data loss). We only scan + UPDATE.
+        val col = android.provider.MediaStore.Video.Media
+            .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+
+        // Scan and WAIT (blocking, with timeout) for completion. scanFile's
+        // callback fires on its own thread; if we returned immediately the
+        // foreground service could stop before the scan/update ran, leaving the
+        // gallery showing the auto-scanner's partial cache (the "首次缺信息" bug).
+        val scannedUri = java.util.concurrent.atomic.AtomicReference<android.net.Uri?>(null)
+        val latch = java.util.concurrent.CountDownLatch(1)
         try {
-            val col = android.provider.MediaStore.Video.Media
-                .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
-
-            // NOTE: never call contentResolver.delete() here — MediaStore.delete
-            // removes the PHYSICAL FILE too, which previously wiped the converted
-            // output (data loss). We only ever re-scan and UPDATE columns.
-
-            // Re-scan. The scan completes asynchronously and calls back with the
-            // fresh row URI — only THEN do we overwrite the metadata columns
-            // (querying before the scan finishes would race and lose).
             android.media.MediaScannerConnection.scanFile(
                 context, arrayOf(f.absolutePath), arrayOf("video/mp4")
-            ) { _, scannedUri ->
-                try {
-                    val uri = scannedUri ?: context.contentResolver.query(col,
-                        arrayOf(android.provider.MediaStore.MediaColumns._ID),
-                        "${android.provider.MediaStore.MediaColumns.DATA}=?",
-                        arrayOf(f.absolutePath), null)?.use { c ->
-                        if (c.moveToFirst())
-                            android.content.ContentUris.withAppendedId(col, c.getLong(0))
-                        else null
-                    } ?: return@scanFile
-                    val cv = android.content.ContentValues()
-                    meta.shootMs?.let { cv.put("datetaken", it) }
-                    if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
-                    if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
-                    gpsLat?.let { cv.put("latitude",  it.toDouble()) }
-                    gpsLon?.let { cv.put("longitude", it.toDouble()) }
-                    if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
-                } catch (_: Exception) {}
-            }
+            ) { _, uri -> scannedUri.set(uri); latch.countDown() }
+            latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: Exception) {}
+
+        try {
+            val uri = scannedUri.get() ?: context.contentResolver.query(col,
+                arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                "${android.provider.MediaStore.MediaColumns.DATA}=?",
+                arrayOf(f.absolutePath), null)?.use { c ->
+                if (c.moveToFirst())
+                    android.content.ContentUris.withAppendedId(col, c.getLong(0))
+                else null
+            } ?: return
+            val cv = android.content.ContentValues()
+            meta.shootMs?.let { cv.put("datetaken", it) }
+            if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
+            if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
+            gpsLat?.let { cv.put("latitude",  it.toDouble()) }
+            gpsLon?.let { cv.put("longitude", it.toDouble()) }
+            if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
         } catch (_: Exception) {}
     }
 
