@@ -590,26 +590,42 @@ object VideoTranscoder {
         gpsLat: Float?, gpsLon: Float?
     ) {
         try {
-            // Trigger a fresh scan of the final file (async). We then locate the
-            // row by _data path and overwrite the metadata columns.
-            android.media.MediaScannerConnection.scanFile(
-                context, arrayOf(f.absolutePath), arrayOf("video/mp4"), null)
             val col = android.provider.MediaStore.Video.Media
                 .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            val uri = context.contentResolver.query(col,
-                arrayOf(android.provider.MediaStore.MediaColumns._ID),
-                "${android.provider.MediaStore.MediaColumns.DATA}=?",
-                arrayOf(f.absolutePath), null)?.use { c ->
-                if (c.moveToFirst()) android.content.ContentUris.withAppendedId(col, c.getLong(0))
-                else null
-            } ?: return
-            val cv = android.content.ContentValues()
-            meta.shootMs?.let { cv.put("datetaken", it) }
-            if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
-            if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
-            gpsLat?.let { cv.put("latitude",  it.toDouble()) }
-            gpsLon?.let { cv.put("longitude", it.toDouble()) }
-            if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
+
+            // The auto-scanner may have already cached this row from a partial
+            // (pre-injection) state — that's the "首次缺信息，拷贝后正常" bug.
+            // DELETE any existing row first so the next scan rebuilds from the
+            // final, fully-injected file.
+            try {
+                context.contentResolver.delete(col,
+                    "${android.provider.MediaStore.MediaColumns.DATA}=?", arrayOf(f.absolutePath))
+            } catch (_: Exception) {}
+
+            // Re-scan. The scan completes asynchronously and calls back with the
+            // fresh row URI — only THEN do we overwrite the metadata columns
+            // (querying before the scan finishes would race and lose).
+            android.media.MediaScannerConnection.scanFile(
+                context, arrayOf(f.absolutePath), arrayOf("video/mp4")
+            ) { _, scannedUri ->
+                try {
+                    val uri = scannedUri ?: context.contentResolver.query(col,
+                        arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                        "${android.provider.MediaStore.MediaColumns.DATA}=?",
+                        arrayOf(f.absolutePath), null)?.use { c ->
+                        if (c.moveToFirst())
+                            android.content.ContentUris.withAppendedId(col, c.getLong(0))
+                        else null
+                    } ?: return@scanFile
+                    val cv = android.content.ContentValues()
+                    meta.shootMs?.let { cv.put("datetaken", it) }
+                    if (meta.width > 0)  cv.put(android.provider.MediaStore.MediaColumns.WIDTH, meta.width)
+                    if (meta.height > 0) cv.put(android.provider.MediaStore.MediaColumns.HEIGHT, meta.height)
+                    gpsLat?.let { cv.put("latitude",  it.toDouble()) }
+                    gpsLon?.let { cv.put("longitude", it.toDouble()) }
+                    if (cv.size() > 0) context.contentResolver.update(uri, cv, null, null)
+                } catch (_: Exception) {}
+            }
         } catch (_: Exception) {}
     }
 
