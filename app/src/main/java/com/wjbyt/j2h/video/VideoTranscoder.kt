@@ -593,14 +593,9 @@ object VideoTranscoder {
             val col = android.provider.MediaStore.Video.Media
                 .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
 
-            // The auto-scanner may have already cached this row from a partial
-            // (pre-injection) state — that's the "首次缺信息，拷贝后正常" bug.
-            // DELETE any existing row first so the next scan rebuilds from the
-            // final, fully-injected file.
-            try {
-                context.contentResolver.delete(col,
-                    "${android.provider.MediaStore.MediaColumns.DATA}=?", arrayOf(f.absolutePath))
-            } catch (_: Exception) {}
+            // NOTE: never call contentResolver.delete() here — MediaStore.delete
+            // removes the PHYSICAL FILE too, which previously wiped the converted
+            // output (data loss). We only ever re-scan and UPDATE columns.
 
             // Re-scan. The scan completes asynchronously and calls back with the
             // fresh row URI — only THEN do we overwrite the metadata columns
