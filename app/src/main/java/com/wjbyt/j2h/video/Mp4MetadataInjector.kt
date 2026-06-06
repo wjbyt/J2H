@@ -223,9 +223,13 @@ object Mp4MetadataInjector {
     private fun buildVivoUuidBox(model: String): ByteArray {
         val magic = "vivoMediaExtInfo".toByteArray(Charsets.US_ASCII)  // exactly 16 bytes
         val safe = model.replace("\\", "").replace("\"", "")
-        // Include the same fields a native vivo camera video writes so the gallery
-        // recognises this as a vivo-produced video and shows 拍摄设备.
-        val json = "vivo{" +
+        // Byte-exact replication of a native vivo camera video's uuid box. The
+        // payload format is:  "vivo" + JSON + BE32(json byte length) + "cameralbum!"
+        // Confirmed by experiment: omitting the BE32 length or the trailing
+        // "cameralbum!" marker makes vivo's gallery ignore the box entirely
+        // (拍摄设备 stays blank). The JSON also carries the full native field set.
+        val json = "{" +
+            "\"com.android.camera.temperature\":36," +
             "\"com.android.camera.takenmodel\":\"$safe\"," +
             "\"com.android.camera.moduleid\":\"video\"," +
             "\"com.android.camera.camerafacing\":\"0\"," +
@@ -235,8 +239,28 @@ object Mp4MetadataInjector {
             "\"Facing\":\"back\"," +
             "\"FilmFormat\":\"false\"," +
             "\"MicDevice\":\"MicDevice\"," +
+            "\"VideoBeauty\":\"origin\"," +
+            "\"VideoSuperNight\":\"off\"," +
+            "\"VideoAeLux \":\"300.0\"," +
+            "\"videoAngleExpand\":\"0\"," +
+            "\"VideoAvailableMemory\":\"4.00G\"," +
+            "\"CpuUsage\":\"0.50\"," +
+            "\"StartShellTempure\":\"35\"," +
+            "\"StartBoardTempure\":\"35\"," +
+            "\"VideoIcState\":\"ic_off\"," +
+            "\"EndShellTempure\":\"36\"," +
+            "\"EndBoardTempure\":\"36\"," +
             "\"version\":2104}"
-        val payload = json.toByteArray(Charsets.UTF_8)
+        val jsonBytes = json.toByteArray(Charsets.UTF_8)
+        val tail = "cameralbum!".toByteArray(Charsets.US_ASCII)
+        // payload = "vivo" + JSON + BE32(jsonLen) + "cameralbum!"
+        val payload = ByteArray(4 + jsonBytes.size + 4 + tail.size)
+        var p = 0
+        "vivo".toByteArray(Charsets.US_ASCII).let { System.arraycopy(it, 0, payload, p, 4); p += 4 }
+        System.arraycopy(jsonBytes, 0, payload, p, jsonBytes.size); p += jsonBytes.size
+        writeBE32(payload, p, jsonBytes.size); p += 4
+        System.arraycopy(tail, 0, payload, p, tail.size)
+
         val size = 8 + magic.size + payload.size
         val out = ByteArray(size)
         writeBE32(out, 0, size)
